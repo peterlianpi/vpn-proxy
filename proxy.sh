@@ -11,8 +11,9 @@ source "$SCRIPT_DIR/config.sh"
 # NOTE: This script must be run as root (sudo) for iptables
 # Usage: sudo ./proxy.sh start
 
-PIDFILE_SS_REDIR="/tmp/ss-redir.pid"
-PIDFILE_SS_LOCAL="/tmp/ss-local.pid"
+PID_DIR="/run/vpn-proxy"
+PIDFILE_SS_REDIR="$PID_DIR/ss-redir.pid"
+PIDFILE_SS_LOCAL="$PID_DIR/ss-local.pid"
 
 # --- Resolve proxy IP dynamically ---
 resolve_proxy_ip() {
@@ -114,8 +115,14 @@ clean_tproxy() {
     ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
 }
 
+# --- Ensure PID directory exists ---
+ensure_pid_dir() {
+    mkdir -p "$PID_DIR" 2>/dev/null
+}
+
 # --- Start ---
 cmd_start() {
+    ensure_pid_dir
     if pgrep -f "ss-redir.*$SS_REDIR_PORT" >/dev/null; then
         echo "[OK] ss-redir already running"
     else

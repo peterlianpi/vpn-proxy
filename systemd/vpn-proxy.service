@@ -7,6 +7,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+RuntimeDirectory=vpn-proxy
 ExecStart=/home/peter/Documents/project/vpn-proxy/proxy.sh start
 ExecStop=/home/peter/Documents/project/vpn-proxy/proxy.sh stop
 User=root
