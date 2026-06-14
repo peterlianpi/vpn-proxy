@@ -1,0 +1,27 @@
+#!/bin/bash
+# ============================================================
+# Outline VPN Proxy — Configuration Template
+# Copy to config.sh and fill in your values:
+#   cp config.sh.example config.sh
+# ============================================================
+
+# --- Shadowsocks Server ---
+SS_SERVER="your-server.example.com"
+SS_PORT=25266
+SS_PASSWORD="your-password-here"
+SS_METHOD="chacha20-ietf-poly1305"
+
+# Outline access key format:
+# ss://BASE64(method:password)@server:port#name
+# To extract from an access key, run: ./decode-key.sh "ss://..."
+
+# --- Local Ports ---
+SS_REDIR_PORT=10800    # Transparent proxy (ss-redir)
+SS_SOCKS_PORT=1080     # SOCKS5 proxy (ss-local, optional)
+
+# --- Proxy Server IP (anti-loop) ---
+# Set this to the resolved IP of your SS_SERVER to prevent routing loops
+PROXY_IP=""
+
+# --- Excluded IP Ranges (NOT proxied) ---
+EXTRA_EXCLUDED_IPS=""

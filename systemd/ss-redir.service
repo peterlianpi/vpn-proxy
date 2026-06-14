@@ -1,0 +1,19 @@
+[Unit]
+Description=Shadowsocks Transparent Proxy (Outline)
+Documentation=https://github.com/shadowsocks/shadowsocks-libev
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+PIDFile=/run/ss-redir.pid
+EnvironmentFile=/opt/vpn-proxy/config.sh
+ExecStartPre=/bin/bash -c 'PROXY_IP=$(dig +short ${SS_SERVER} | head -1); [ -n "$PROXY_IP" ] || PROXY_IP="13.115.84.100"; echo "$PROXY_IP" > /run/ss-proxy-ip.txt'
+ExecStart=/usr/bin/ss-redir -s ${SS_SERVER} -p ${SS_PORT} -l ${SS_REDIR_PORT} -k ${SS_PASSWORD} -m ${SS_METHOD} -f /run/ss-redir.pid --no-delay --fast-open
+ExecStop=/bin/kill $MAINPID
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

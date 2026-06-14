@@ -1,0 +1,15 @@
+[Unit]
+Description=Outline VPN Proxy (Transparent TCP)
+Documentation=https://github.com/shadowsocks/shadowsocks-libev
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/home/peter/Documents/project/vpn-proxy/proxy.sh start
+ExecStop=/home/peter/Documents/project/vpn-proxy/proxy.sh stop
+User=root
+
+[Install]
+WantedBy=multi-user.target
