@@ -1,17 +1,29 @@
 #!/bin/bash
 # ============================================================
 # Outline VPN Proxy — Main Control Script
-# Usage: ./proxy.sh {start|stop|restart|status} [full|local] [--exclude CIDR ...]
+# Usage: ./proxy.sh {start|stop|restart|status|refresh} [full|local|selective] [--exclude CIDR ...]
 # ============================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/config.sh"
 
+if [[ "${DOMAINS_FILE:-domains.txt}" != /* ]]; then
+    DOMAINS_FILE="$SCRIPT_DIR/${DOMAINS_FILE:-domains.txt}"
+else
+    DOMAINS_FILE="${DOMAINS_FILE:-$SCRIPT_DIR/domains.txt}"
+fi
+
 # NOTE: iptables changes require root (sudo). ss-redir can run as your user.
 # Usage: sudo ./proxy.sh start
 #        ./proxy.sh start local          # only this machine's TCP (OUTPUT)
+#        sudo ./proxy.sh start selective   # only domains in domains.txt
 #        ./proxy.sh start --exclude 1.2.3.4/32
+
+IPSET_NAME="${IPSET_NAME:-vpn_proxy_domains}"
+IPSET_TIMEOUT="${IPSET_TIMEOUT:-3600}"
+DOMAIN_REFRESH_INTERVAL="${DOMAIN_REFRESH_INTERVAL:-300}"
+SELECTIVE_SCOPE="${SELECTIVE_SCOPE:-local}"
 
 if [[ $EUID -eq 0 ]]; then
     PID_DIR="/run/vpn-proxy"
@@ -20,6 +32,8 @@ else
 fi
 PIDFILE_SS_REDIR="$PID_DIR/ss-redir.pid"
 PIDFILE_SS_LOCAL="$PID_DIR/ss-local.pid"
+PIDFILE_DOMAIN_REFRESH="$PID_DIR/domain-refresh.pid"
+PIDFILE_ACTIVE_MODE="$PID_DIR/active-mode"
 
 PROXY_MODE="${PROXY_MODE:-full}"
 RUNTIME_EXCLUDES=()
@@ -27,26 +41,31 @@ CMD=""
 
 usage() {
     cat <<EOF
-Usage: $0 {start|stop|restart|status} [options]
+Usage: $0 {start|stop|restart|status|refresh} [options]
 
 Commands:
   start     Start ss-redir and apply iptables rules
   stop      Remove iptables rules and stop ss-redir
   restart   stop then start
   status    Show process, routing mode, and public IP
+  refresh   Re-resolve domains.txt into ipset (selective mode)
 
 Routing modes (config: PROXY_MODE, override on CLI):
-  full      Proxy all TCP — forwarded + local traffic (default)
-  local     Proxy only locally-generated TCP (OUTPUT chain)
+  full        Proxy all TCP — forwarded + local traffic (default)
+  local       Proxy only locally-generated TCP (OUTPUT chain)
+  selective   Proxy only domains listed in domains.txt (ipset)
 
 Options:
-  --mode MODE       Routing mode: full | local
-  --exclude CIDR    Extra destination to bypass (repeatable)
-  full|local        Shorthand for --mode
+  --mode MODE         Routing mode: full | local | selective
+  --exclude CIDR      Extra destination to bypass (repeatable)
+  --domains-file PATH Domain list file (default: domains.txt)
+  full|local|selective  Shorthand for --mode
 
 Examples:
   sudo $0 start
   sudo $0 start local
+  sudo $0 start selective
+  sudo $0 refresh
   sudo $0 start --exclude 203.0.113.0/24
   $0 status
 EOF
@@ -63,12 +82,16 @@ parse_args() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            full|local)
+            full|local|selective)
                 PROXY_MODE="$1"
                 shift
                 ;;
             --mode)
-                PROXY_MODE="${2:?--mode requires full or local}"
+                PROXY_MODE="${2:?--mode requires full, local, or selective}"
+                shift 2
+                ;;
+            --domains-file)
+                DOMAINS_FILE="${2:?--domains-file requires a path}"
                 shift 2
                 ;;
             --exclude)
@@ -88,9 +111,9 @@ parse_args() {
     done
 
     case "$PROXY_MODE" in
-        full|local) ;;
+        full|local|selective) ;;
         *)
-            echo "[ERROR] Invalid mode '$PROXY_MODE' (use full or local)"
+            echo "[ERROR] Invalid mode '$PROXY_MODE' (use full, local, or selective)"
             exit 1
             ;;
     esac
@@ -125,9 +148,22 @@ iptables_active() {
 }
 
 detect_proxy_mode() {
+    if [[ -f "$PIDFILE_ACTIVE_MODE" ]]; then
+        cat "$PIDFILE_ACTIVE_MODE"
+        return
+    fi
+
     if ! have_root; then
+        if sudo -n test -f "$PIDFILE_ACTIVE_MODE" 2>/dev/null; then
+            sudo -n cat "$PIDFILE_ACTIVE_MODE"
+            return
+        fi
         if sudo -n iptables -t mangle -C PREROUTING -p tcp -j SS_TPROXY 2>/dev/null; then
             echo "full"
+            return
+        fi
+        if sudo -n iptables -t nat -L SS_REDIR -n 2>/dev/null | grep -q "match-set $IPSET_NAME"; then
+            echo "selective"
             return
         fi
         if sudo -n iptables -t nat -C OUTPUT -p tcp -j SS_REDIR 2>/dev/null; then
@@ -139,7 +175,13 @@ detect_proxy_mode() {
     fi
 
     if iptables -t mangle -L SS_TPROXY -n 2>/dev/null | grep -q TPROXY; then
-        echo "full"
+        if iptables -t mangle -L SS_TPROXY -n 2>/dev/null | grep -q "match-set $IPSET_NAME"; then
+            echo "selective"
+        else
+            echo "full"
+        fi
+    elif iptables -t nat -L SS_REDIR -n 2>/dev/null | grep -q "match-set $IPSET_NAME"; then
+        echo "selective"
     elif iptables -t nat -L SS_REDIR -n 2>/dev/null | grep -q REDIRECT; then
         echo "local"
     else
@@ -180,6 +222,92 @@ all_excluded_ips() {
     for ip in "${items[@]}"; do
         [[ -n "$ip" ]] && printf '%s\n' "$ip"
     done
+}
+
+require_ipset() {
+    if ! command -v ipset >/dev/null 2>&1; then
+        echo "[ERROR] ipset not found. Install: sudo apt install ipset"
+        exit 1
+    fi
+}
+
+read_domains() {
+    if [[ ! -f "$DOMAINS_FILE" ]]; then
+        echo "[ERROR] Domain list not found: $DOMAINS_FILE"
+        echo "        Copy: cp domains.txt.example domains.txt"
+        exit 1
+    fi
+    grep -vE '^\s*($|#)' "$DOMAINS_FILE" | sed 's/#.*//' | awk 'NF {print $1}'
+}
+
+ensure_ipset() {
+    require_ipset
+    if ! ipset list "$IPSET_NAME" &>/dev/null; then
+        ipset create "$IPSET_NAME" hash:ip family inet hashsize 4096 maxelem 65536 timeout "$IPSET_TIMEOUT"
+    fi
+}
+
+resolve_domains_to_ipset() {
+    local quiet="${1:-}"
+    local flush="${2:-}"
+
+    require_ipset
+    ensure_ipset
+    if [[ "$flush" == "flush" ]]; then
+        ipset flush "$IPSET_NAME"
+    fi
+
+    local domain ip
+    while IFS= read -r domain; do
+        [[ -z "$domain" ]] && continue
+        while IFS= read -r ip; do
+            [[ -z "$ip" ]] && continue
+            ipset add "$IPSET_NAME" "$ip" -exist timeout "$IPSET_TIMEOUT"
+        done < <(dig +short A "$domain" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+    done < <(read_domains)
+
+    if [[ "$quiet" != "quiet" ]]; then
+        local set_size
+        set_size=$(ipset list "$IPSET_NAME" | grep -cE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' || true)
+        echo "[OK] ipset $IPSET_NAME: $set_size entries (from $DOMAINS_FILE)"
+    fi
+}
+
+destroy_ipset() {
+    ipset destroy "$IPSET_NAME" 2>/dev/null || true
+}
+
+start_domain_refresh() {
+    [[ "$PROXY_MODE" != "selective" ]] && return 0
+
+    stop_domain_refresh
+    (
+        while true; do
+            sleep "$DOMAIN_REFRESH_INTERVAL"
+            resolve_domains_to_ipset quiet || true
+        done
+    ) &
+    echo "$!" > "$PIDFILE_DOMAIN_REFRESH"
+}
+
+stop_domain_refresh() {
+    if [[ -f "$PIDFILE_DOMAIN_REFRESH" ]]; then
+        local pid
+        pid=$(cat "$PIDFILE_DOMAIN_REFRESH" 2>/dev/null || true)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+        fi
+        rm -f "$PIDFILE_DOMAIN_REFRESH"
+    fi
+}
+
+write_active_mode() {
+    ensure_pid_dir
+    echo "$PROXY_MODE" > "$PIDFILE_ACTIVE_MODE"
+}
+
+clear_active_mode() {
+    rm -f "$PIDFILE_ACTIVE_MODE"
 }
 
 # --- Apply iptables transparent proxy rules ---
@@ -224,15 +352,32 @@ apply_tproxy() {
         iptables -t nat -A SS_REDIR -d "$ip" -j RETURN
     done < <(all_excluded_ips)
 
+    local use_tproxy=false
     if [[ "$mode" == "full" ]]; then
-        iptables -t mangle -A SS_TPROXY -p tcp -j TPROXY --on-port "$ss_redir_port" --tproxy-mark 1
+        use_tproxy=true
+    elif [[ "$mode" == "selective" && "$SELECTIVE_SCOPE" == "full" ]]; then
+        use_tproxy=true
+    fi
+
+    if $use_tproxy; then
+        if [[ "$mode" == "selective" ]]; then
+            iptables -t mangle -A SS_TPROXY -m set --match-set "$IPSET_NAME" dst -p tcp \
+                -j TPROXY --on-port "$ss_redir_port" --tproxy-mark 1
+        else
+            iptables -t mangle -A SS_TPROXY -p tcp -j TPROXY --on-port "$ss_redir_port" --tproxy-mark 1
+        fi
         iptables -t mangle -C PREROUTING -p tcp -j SS_TPROXY 2>/dev/null \
             || iptables -t mangle -A PREROUTING -p tcp -j SS_TPROXY
         ip rule add fwmark 1 lookup 100 priority 100 2>/dev/null || true
         ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
     fi
 
-    iptables -t nat -A SS_REDIR -p tcp -j REDIRECT --to-ports "$ss_redir_port"
+    if [[ "$mode" == "selective" ]]; then
+        iptables -t nat -A SS_REDIR -m set --match-set "$IPSET_NAME" dst -p tcp \
+            -j REDIRECT --to-ports "$ss_redir_port"
+    else
+        iptables -t nat -A SS_REDIR -p tcp -j REDIRECT --to-ports "$ss_redir_port"
+    fi
     iptables -t nat -C OUTPUT -p tcp -j SS_REDIR 2>/dev/null \
         || iptables -t nat -A OUTPUT -p tcp -j SS_REDIR
 }
@@ -251,6 +396,10 @@ clean_tproxy() {
 
     ip rule del fwmark 1 lookup 100 2>/dev/null || true
     ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
+
+    stop_domain_refresh
+    destroy_ipset
+    clear_active_mode
 }
 
 ensure_pid_dir() {
@@ -307,8 +456,9 @@ start_ss_redir() {
 
 describe_mode() {
     case "$PROXY_MODE" in
-        full)  echo "all TCP (forwarded + local)" ;;
-        local) echo "local TCP only (OUTPUT)" ;;
+        full)      echo "all TCP (forwarded + local)" ;;
+        local)     echo "local TCP only (OUTPUT)" ;;
+        selective) echo "domains in $(basename "$DOMAINS_FILE") ($SELECTIVE_SCOPE scope)" ;;
     esac
 }
 
@@ -318,13 +468,24 @@ cmd_start() {
 
     require_root "start"
 
+    if [[ "$PROXY_MODE" == "selective" ]]; then
+        echo "[..] Resolving domains from $DOMAINS_FILE ..."
+        resolve_domains_to_ipset "" flush
+    fi
+
     local proxy_ip
     proxy_ip=$(resolve_proxy_ip)
     echo "[..] Applying transparent proxy rules (mode=$(describe_mode), exclude: $proxy_ip) ..."
     apply_tproxy "$proxy_ip" "$SS_REDIR_PORT" "$PROXY_MODE"
+    write_active_mode
+    start_domain_refresh
     echo "[OK] Transparent proxy active — $(describe_mode) via $SS_SERVER:$SS_PORT"
     echo ""
-    echo "    SSH/RDP/LAN and excluded destinations are NOT proxied"
+    if [[ "$PROXY_MODE" == "selective" ]]; then
+        echo "    Only listed domains are proxied; refresh IPs: sudo $0 refresh"
+    else
+        echo "    SSH/RDP/LAN and excluded destinations are NOT proxied"
+    fi
     echo "    To stop: sudo $0 stop"
 }
 
@@ -378,6 +539,10 @@ cmd_status() {
             tproxy_active=true
             mode_label="ACTIVE   (mode=local — OUTPUT TCP via proxy)"
             ;;
+        selective)
+            tproxy_active=true
+            mode_label="ACTIVE   (mode=selective — listed domains via proxy)"
+            ;;
         *)
             mode_label="INACTIVE (direct connection)"
             ;;
@@ -387,6 +552,12 @@ cmd_status() {
         tproxy_active=true
     fi
     echo "  TPROXY    : $mode_label"
+
+    if [[ "$active_mode" == "selective" ]] && have_root && ipset list "$IPSET_NAME" &>/dev/null; then
+        local set_size
+        set_size=$(ipset list "$IPSET_NAME" | grep -cE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' || true)
+        echo "  ipset     : $IPSET_NAME ($set_size entries)"
+    fi
 
     if $tproxy_active && ! ss_redir_running && [[ "$active_mode" != "none" ]]; then
         echo ""
@@ -401,6 +572,17 @@ cmd_status() {
         curl -s --connect-timeout 5 https://ipinfo.io/json 2>/dev/null || echo "(timeout)"
     fi
     echo ""
+}
+
+# --- Refresh domain ipset ---
+cmd_refresh() {
+    require_root "refresh"
+    if ! ipset list "$IPSET_NAME" &>/dev/null; then
+        echo "[ERROR] ipset $IPSET_NAME not active. Start selective mode first."
+        exit 1
+    fi
+    echo "[..] Refreshing domain IPs from $DOMAINS_FILE ..."
+    resolve_domains_to_ipset
 }
 
 # --- Reload (restart) ---
@@ -430,6 +612,7 @@ case "$CMD" in
     start)   cmd_start ;;
     stop)    cmd_stop ;;
     restart|reload) cmd_reload ;;
+    refresh) cmd_refresh ;;
     status)  cmd_status ;;
     *)
         usage

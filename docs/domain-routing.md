@@ -56,9 +56,17 @@ Set default condition to **Direct**. Only matching URLs use the proxy.
 
 ---
 
-## Option 2: System-wide selective routing (ipset)
+## Option 2: System-wide selective routing (`selective` mode)
 
-Route only traffic to IPs that belong to listed domains. Requires root and periodic IP refresh (CDNs change addresses).
+Route only traffic to IPs that belong to listed domains. Built into `proxy.sh` via **ipset**.
+
+### Setup
+
+```bash
+cp domains.txt.example domains.txt   # edit: add AI Studio, Facebook, etc.
+sudo apt install ipset               # if not installed
+sudo ./proxy.sh start selective
+```
 
 ### How it works
 
@@ -66,32 +74,33 @@ Route only traffic to IPs that belong to listed domains. Requires root and perio
 domains.txt  →  dig/resolve  →  ipset (vpn_proxy_domains)  →  iptables  →  ss-redir
 ```
 
-1. Maintain a domain list (see `domains.txt.example`).
-2. Resolve domains to IPs and load into an **ipset** with timeout.
-3. iptables only REDIRECTs/TPROXYs TCP when destination is in that set.
-4. Refresh the set every few minutes (cron or systemd timer).
+1. Domains are resolved to IPs and stored in **ipset** (with timeout).
+2. iptables only REDIRECTs TCP when the destination IP is in the set.
+3. A background job re-resolves every 5 minutes (config: `DOMAIN_REFRESH_INTERVAL`).
+4. Manual refresh: `sudo ./proxy.sh refresh`
 
 ### Example domain list
 
-```
-aistudio.google.com
-googleapis.com
-google.com
-gstatic.com
-facebook.com
-fbcdn.net
-```
+See `domains.txt.example` for Google AI Studio and Facebook entries.
+
+### Config (`config.sh`)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DOMAINS_FILE` | `domains.txt` | Domain list (one per line) |
+| `IPSET_NAME` | `vpn_proxy_domains` | ipset name |
+| `IPSET_TIMEOUT` | `3600` | IP entry lifetime (seconds) |
+| `DOMAIN_REFRESH_INTERVAL` | `300` | Auto re-resolve interval |
+| `SELECTIVE_SCOPE` | `local` | `local` = this machine only; `full` = forwarded traffic too |
 
 ### Caveats
 
-- **Google / Facebook use many CDN IPs** — include related domains (`*.googleapis.com`, `fbcdn.net`, etc.).
-- **First request** to a new subdomain may go direct until the next resolve refresh.
+- **Google / Facebook use many CDN IPs** — include related domains (`googleapis.com`, `fbcdn.net`, etc.).
+- **First request** to a new subdomain may go direct until the next refresh.
 - **UDP/QUIC** (e.g. HTTP/3) is not handled by `ss-redir` (TCP only).
 - Some apps use hardcoded IPs and bypass DNS.
 
-> **Status:** `selective` mode is documented here for manual setup. Built-in `sudo ./proxy.sh start selective` may be added in a future release.
-
-### Manual ipset + iptables sketch
+### Manual ipset sketch (if not using proxy.sh)
 
 ```bash
 # Create set (IPs expire after 1 hour)
@@ -144,8 +153,8 @@ iptables then matches `-m set --match-set vpn_proxy_domains dst` as in Option 2.
 | Goal | Use |
 |------|-----|
 | Only AI Studio / Facebook in browser | **Option 1** — SOCKS + SwitchyOmega |
-| One or two CLI apps by domain | **Option 2** — ipset + domain list |
-| Many domains, all apps | **Option 3** — dnsmasq + ipset |
+| Listed domains, system-wide (apps) | **Option 2** — `sudo ./proxy.sh start selective` |
+| Many domains, DNS-driven | **Option 3** — dnsmasq + ipset |
 | Everything through VPN | `sudo ./proxy.sh start` (full) |
 | Only this machine's apps, all TCP | `sudo ./proxy.sh start local` |
 

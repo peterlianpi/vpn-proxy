@@ -24,9 +24,17 @@ SS_SOCKS_PORT=1080     # SOCKS5 proxy (ss-local, optional)
 PROXY_IP=""
 
 # --- Routing mode ---
-# full  = all TCP (forwarded traffic + local apps) — needs sudo
-# local = only locally-generated TCP (OUTPUT chain) — needs sudo
+# full      = all TCP (forwarded + local apps) — needs sudo
+# local     = only locally-generated TCP (OUTPUT chain) — needs sudo
+# selective = only domains in domains.txt (ipset) — needs sudo + ipset
 PROXY_MODE="full"
+
+# Selective mode: cp domains.txt.example domains.txt
+DOMAINS_FILE="domains.txt"
+IPSET_NAME="vpn_proxy_domains"
+IPSET_TIMEOUT=3600
+DOMAIN_REFRESH_INTERVAL=300
+SELECTIVE_SCOPE="local"
 
 # --- Excluded IP Ranges (NOT proxied) ---
 # Space-separated CIDRs; also pass at runtime: ./proxy.sh start --exclude 1.2.3.4/32

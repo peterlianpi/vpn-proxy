@@ -42,12 +42,15 @@ sudo ./proxy.sh stop
 |------|---------|-------------------|
 | `full` | `sudo ./proxy.sh start` | All TCP (forwarded + local) — default |
 | `local` | `sudo ./proxy.sh start local` | Only this machine's TCP (OUTPUT) |
+| `selective` | `sudo ./proxy.sh start selective` | Only domains in `domains.txt` |
 
 Extra options:
 
 ```bash
 sudo ./proxy.sh start --exclude 203.0.113.0/24   # bypass specific CIDR
 sudo ./proxy.sh start --mode local
+sudo ./proxy.sh refresh                          # re-resolve domain IPs (selective)
+cp domains.txt.example domains.txt               # then edit domain list
 ./proxy.sh help
 ```
 
@@ -69,7 +72,7 @@ Set default mode in `config.sh`: `PROXY_MODE="full"` or `PROXY_MODE="local"`.
 iptables cannot match domain names — only IPs. For sites like **Google AI Studio** or **Facebook** only:
 
 - **Browser:** SOCKS (`ss-local`) + SwitchyOmega — see [docs/domain-routing.md](docs/domain-routing.md)
-- **System-wide:** ipset + domain list or dnsmasq — see [docs/domain-routing.md](docs/domain-routing.md)
+- **System-wide:** `sudo ./proxy.sh start selective` with `domains.txt` — see [docs/domain-routing.md](docs/domain-routing.md)
 
 ## Configuration
 
@@ -82,7 +85,8 @@ Edit `config.sh`:
 | `SS_PASSWORD` | Password (from access key) |
 | `SS_METHOD` | Encryption method (e.g. `chacha20-ietf-poly1305`) |
 | `PROXY_IP` | Resolved IP of proxy server (anti-loop); auto-resolved if empty |
-| `PROXY_MODE` | `full` or `local` |
+| `PROXY_MODE` | `full`, `local`, or `selective` |
+| `DOMAINS_FILE` | Domain list for selective mode (`domains.txt`) |
 | `SS_REDIR_PORT` | Transparent proxy port (default `10800`) |
 | `SS_SOCKS_PORT` | SOCKS port for browser proxy (default `1080`) |
 | `EXTRA_EXCLUDED_IPS` | Space-separated CIDRs to bypass (management IPs, etc.) |
@@ -150,4 +154,5 @@ With WARP + VPN:
 
 - `shadowsocks-libev` (`ss-redir`, `ss-local`)
 - `iptables`, `ip` (iproute2)
+- `ipset` (for selective mode)
 - `dig` or `getent` for DNS resolution
