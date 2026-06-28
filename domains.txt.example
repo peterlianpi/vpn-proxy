@@ -1,14 +1,18 @@
 # Domains to route through the proxy (for ipset / selective routing)
-# Copy to domains.txt and edit. One domain per line; # comments allowed.
+# Copy ONE of these and edit:
+#   cp domains-myanmar.txt.example domains.txt   # Myanmar censorship + AI geo-blocks (recommended)
+#   cp domains.txt.example domains.txt           # minimal starter list
 #
-# Google AI Studio
+# One domain per line; # comments allowed.
+
+# Google AI Studio (minimal)
 aistudio.google.com
 googleapis.com
 google.com
 gstatic.com
 googleusercontent.com
-#
-# Facebook
+
+# Facebook (minimal)
 facebook.com
 fbcdn.net
 fb.com

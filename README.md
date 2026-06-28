@@ -44,7 +44,8 @@ sudo ./proxy.sh stop
 | `local` | `sudo ./proxy.sh start local` | Only this machine's TCP (OUTPUT) |
 | `selective` | `sudo ./proxy.sh start selective` | Only domains in `domains.txt` |
 
-Extra options:
+Use `domains-myanmar.txt.example` for a pre-built list of junta-blocked social + geo-restricted AI services.
+
 
 ```bash
 sudo ./proxy.sh start --exclude 203.0.113.0/24   # bypass specific CIDR

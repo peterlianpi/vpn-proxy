@@ -63,8 +63,10 @@ Route only traffic to IPs that belong to listed domains. Built into `proxy.sh` v
 ### Setup
 
 ```bash
-cp domains.txt.example domains.txt   # edit: add AI Studio, Facebook, etc.
-sudo apt install ipset               # if not installed
+cp domains-myanmar.txt.example domains.txt   # full Myanmar list (recommended)
+# or: cp domains.txt.example domains.txt    # minimal starter
+nano domains.txt                             # trim or add domains
+sudo apt install ipset
 sudo ./proxy.sh start selective
 ```
 

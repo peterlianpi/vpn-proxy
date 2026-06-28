@@ -1,0 +1,118 @@
+# Myanmar — tech, social & AI domains for selective proxy
+# Copy: cp domains-myanmar.txt.example domains.txt
+#
+# Two reasons these need a proxy from Myanmar:
+#   A) Junta censorship (since 2021 coup) — OONI-verified blocks
+#   B) Service geo-restriction — provider does not support Myanmar (e.g. Google AI Studio)
+#
+# Sources: OONI/internetinmyanmar.com (2024–2026), Freedom House, Google AI regions list
+# Blocking varies by ISP/day — this list is a practical superset, not guaranteed complete.
+#
+# NOTE: Meta/Google use many CDN subdomains (scontent.*.fbcdn.net etc.).
+#       selective mode resolves these base domains only; add more if images/assets fail.
+#       For Facebook-heavy use, browser SOCKS + SwitchyOmega is often more reliable.
+
+# =============================================================================
+# SOCIAL — blocked by Myanmar junta (OONI ≥60% anomaly)
+# =============================================================================
+
+# Facebook / Meta
+facebook.com
+fb.com
+fbcdn.net
+facebook.net
+fbsbx.com
+messenger.com
+
+# Instagram
+instagram.com
+cdninstagram.com
+
+# WhatsApp
+whatsapp.com
+web.whatsapp.com
+
+# X / Twitter
+twitter.com
+x.com
+t.co
+twimg.com
+
+# Signal (blocked Jul 2024)
+signal.org
+
+# Telegram (restricted / monitored; include if needed)
+telegram.org
+t.me
+
+# TikTok (surveillance target; may be blocked on some ISPs)
+tiktok.com
+tiktokcdn.com
+tiktokv.com
+byteoversea.com
+
+# =============================================================================
+# REFERENCE — Wikipedia blocked 2022
+# =============================================================================
+wikipedia.org
+wikimedia.org
+
+# =============================================================================
+# GOOGLE AI / GEMINI — NOT in supported regions (Myanmar absent from list)
+# https://ai.google.dev/gemini-api/docs/available-regions
+# =============================================================================
+aistudio.google.com
+ai.google.dev
+gemini.google.com
+makersuite.google.com
+generativelanguage.googleapis.com
+notebooklm.google.com
+labs.google
+google.com
+googleapis.com
+gstatic.com
+googleusercontent.com
+accounts.google.com
+
+# =============================================================================
+# OPENAI / ChatGPT — country restrictions / inconsistent Myanmar access
+# =============================================================================
+chatgpt.com
+chat.openai.com
+openai.com
+api.openai.com
+platform.openai.com
+auth.openai.com
+oaistatic.com
+oaiusercontent.com
+
+# =============================================================================
+# ANTHROPIC / Claude — Myanmar not in supported regions
+# =============================================================================
+claude.ai
+anthropic.com
+api.anthropic.com
+
+# =============================================================================
+# OTHER AI / DEV TOOLS (geo or payment restrictions common)
+# =============================================================================
+huggingface.co
+replicate.com
+cohere.com
+perplexity.ai
+poe.com
+cursor.com
+copilot.microsoft.com
+bing.com
+
+# =============================================================================
+# OTHER SOCIAL / COMMUNITY (often needed alongside above)
+# =============================================================================
+discord.com
+discordapp.com
+discord.gg
+linkedin.com
+reddit.com
+snapchat.com
+pinterest.com
+viber.com
