@@ -1,0 +1,14 @@
+# Domains to route through the proxy (for ipset / selective routing)
+# Copy to domains.txt and edit. One domain per line; # comments allowed.
+#
+# Google AI Studio
+aistudio.google.com
+googleapis.com
+google.com
+gstatic.com
+googleusercontent.com
+#
+# Facebook
+facebook.com
+fbcdn.net
+fb.com

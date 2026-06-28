@@ -23,5 +23,11 @@ SS_SOCKS_PORT=1080     # SOCKS5 proxy (ss-local, optional)
 # Set this to the resolved IP of your SS_SERVER to prevent routing loops
 PROXY_IP=""
 
+# --- Routing mode ---
+# full  = all TCP (forwarded traffic + local apps) — needs sudo
+# local = only locally-generated TCP (OUTPUT chain) — needs sudo
+PROXY_MODE="full"
+
 # --- Excluded IP Ranges (NOT proxied) ---
+# Space-separated CIDRs; also pass at runtime: ./proxy.sh start --exclude 1.2.3.4/32
 EXTRA_EXCLUDED_IPS=""
