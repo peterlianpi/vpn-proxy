@@ -111,9 +111,37 @@ Traffic to these destinations goes **direct** (bypasses the VPN):
 
 SSH/RDP/VNC to your machine's LAN IP stays direct.
 
+## System Install (global command)
+
+Install once, then run `vpn-proxy` from any directory:
+
+```bash
+sudo ./install.sh
+```
+
+One line from GitHub:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/peterlianpi/vpn-proxy/main/install.sh | sudo bash
+```
+
+After install:
+
+```bash
+vpn-proxy status
+vpn-proxy start
+vpn-proxy stop
+vpn-proxy logs -f
+systemctl enable vpn-proxy   # start on boot
+```
+
+Installs to `/opt/vpn-proxy`, links `/usr/local/bin/vpn-proxy`, and sets up passwordless sudo for the installing user. Logs: `/var/log/vpn-proxy/vpn-proxy.log`.
+
 ## Auto-Start on Boot
 
 ```bash
+sudo ./install.sh                  # recommended — installs command + systemd unit
+# or manually:
 sudo cp systemd/vpn-proxy.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now vpn-proxy

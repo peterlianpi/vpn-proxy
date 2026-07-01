@@ -5,7 +5,18 @@
 # ============================================================
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_script_path="${BASH_SOURCE[0]}"
+if command -v readlink >/dev/null 2>&1; then
+    _script_path="$(readlink -f "$_script_path" 2>/dev/null || echo "$_script_path")"
+fi
+SCRIPT_DIR="$(cd "$(dirname "$_script_path")" && pwd)"
+
+if [[ -f "$SCRIPT_DIR/lib/log.sh" ]]; then
+    # shellcheck source=lib/log.sh
+    source "$SCRIPT_DIR/lib/log.sh"
+    vp_log_init
+fi
+
 source "$SCRIPT_DIR/config.sh"
 
 if [[ "${DOMAINS_FILE:-domains.txt}" != /* ]]; then
@@ -49,6 +60,7 @@ Commands:
   restart   stop then start
   status    Show process, routing mode, and public IP
   refresh   Re-resolve domains.txt into ipset (selective mode)
+  logs      Show log file (e.g. logs -f, logs -n 200)
 
 Routing modes (config: PROXY_MODE, override on CLI):
   full        Proxy all TCP — forwarded + local traffic (default)
@@ -606,6 +618,17 @@ cmd_reload() {
 }
 
 # --- Main ---
+if [[ "${1:-}" == "logs" ]]; then
+    shift
+    if declare -F vp_logs >/dev/null 2>&1; then
+        vp_logs "$@"
+    else
+        echo "[ERROR] Logging not installed. Run: sudo ./install.sh"
+        exit 1
+    fi
+    exit 0
+fi
+
 parse_args "$@"
 
 case "$CMD" in
