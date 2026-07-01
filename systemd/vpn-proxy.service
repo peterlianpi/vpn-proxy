@@ -1,16 +1,24 @@
 [Unit]
-Description=Outline VPN Proxy (Transparent TCP)
-Documentation=https://github.com/shadowsocks/shadowsocks-libev
-After=network-online.target
+Description=Outline VPN transparent proxy
+Documentation=https://github.com/peterlianpi/vpn-proxy
+After=network-online.target nss-lookup.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+WorkingDirectory=/opt/vpn-proxy
 RuntimeDirectory=vpn-proxy
-ExecStart=/home/peter/Documents/project/vpn-proxy/proxy.sh start
-ExecStop=/home/peter/Documents/project/vpn-proxy/proxy.sh stop
-User=root
+Environment=VP_LOG_DIR=/var/log/vpn-proxy
+ExecStartPre=/opt/vpn-proxy/lib/wait-network.sh
+ExecStart=/usr/local/bin/vpn-proxy start
+ExecStop=/usr/local/bin/vpn-proxy stop
+TimeoutStartSec=180
+TimeoutStopSec=45
+Restart=on-failure
+RestartSec=15
 
 [Install]
 WantedBy=multi-user.target

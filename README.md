@@ -122,7 +122,11 @@ sudo ./install.sh
 One line from GitHub:
 
 ```bash
+# latest
 curl -fsSL https://raw.githubusercontent.com/peterlianpi/vpn-proxy/main/install.sh | sudo bash
+
+# pinned release
+curl -fsSL https://raw.githubusercontent.com/peterlianpi/vpn-proxy/v1.0.0/install.sh | sudo bash
 ```
 
 After install:
@@ -177,6 +181,7 @@ With WARP + VPN:
 | IP check `(timeout)` after `stop` | iptables still redirecting, `ss-redir` dead | `sudo ./proxy.sh stop` |
 | `start` succeeds but IP unchanged | Outline server down | `nc -zv <server> <port>` |
 | `Address already in use` | Lingering `ss-redir` | `sudo pkill -f ss-redir` |
+| Boot start fails | DNS/network not ready at boot | `journalctl -u vpn-proxy`; check `/var/log/vpn-proxy/ss-redir.log` |
 | DNS not resolving | Resolver issue | Add `nameserver 1.1.1.1` to `/etc/resolv.conf` |
 
 ## Requirements

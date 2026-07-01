@@ -441,6 +441,34 @@ stop_ss_redir() {
     fi
 }
 
+ss_redir_log_file() {
+    if [[ -n "${VP_LOG_DIR:-}" ]]; then
+        echo "${VP_LOG_DIR}/ss-redir.log"
+    elif [[ $EUID -eq 0 ]]; then
+        echo "/var/log/vpn-proxy/ss-redir.log"
+    else
+        echo "${XDG_RUNTIME_DIR:-/tmp}/vpn-proxy/ss-redir.log"
+    fi
+}
+
+wait_for_server() {
+    local tries="${SS_START_DNS_TRIES:-30}"
+    local delay="${SS_START_DNS_DELAY:-2}"
+
+    while (( tries-- > 0 )); do
+        if getent hosts "$SS_SERVER" >/dev/null 2>&1; then
+            return 0
+        fi
+        if dig +short A "$SS_SERVER" 2>/dev/null | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+            return 0
+        fi
+        sleep "$delay"
+    done
+
+    echo "[ERROR] DNS not ready for $SS_SERVER (waited $((SS_START_DNS_TRIES * SS_START_DNS_DELAY))s)" >&2
+    return 1
+}
+
 start_ss_redir() {
     ensure_pid_dir
     if ss_redir_running; then
@@ -448,22 +476,35 @@ start_ss_redir() {
         return 0
     fi
 
+    wait_for_server || return 1
+
+    local log_file attempts pid
+    log_file="$(ss_redir_log_file)"
+    mkdir -p "$(dirname "$log_file")" 2>/dev/null || true
+    attempts="${SS_START_ATTEMPTS:-5}"
+
     echo "[..] Starting ss-redir (transparent proxy) on :$SS_REDIR_PORT ..."
-    nohup ss-redir -s "$SS_SERVER" -p "$SS_PORT" \
-                   -l "$SS_REDIR_PORT" \
-                   -k "$SS_PASSWORD" \
-                   -m "$SS_METHOD" \
-                   --no-delay >/dev/null 2>&1 &
-    local pid=$!
-    echo "$pid" > "$PIDFILE_SS_REDIR"
-    sleep 2
-    if kill -0 "$pid" 2>/dev/null; then
-        echo "[OK] ss-redir started (pid=$pid)"
-    else
-        echo "[ERROR] ss-redir failed to start"
+    while (( attempts-- > 0 )); do
+        nohup ss-redir -s "$SS_SERVER" -p "$SS_PORT" \
+                       -l "$SS_REDIR_PORT" \
+                       -k "$SS_PASSWORD" \
+                       -m "$SS_METHOD" \
+                       --no-delay >>"$log_file" 2>&1 &
+        pid=$!
+        echo "$pid" > "$PIDFILE_SS_REDIR"
+        sleep 3
+        if kill -0 "$pid" 2>/dev/null && ss_redir_running; then
+            echo "[OK] ss-redir started (pid=$pid)"
+            return 0
+        fi
         rm -f "$PIDFILE_SS_REDIR"
-        return 1
-    fi
+        pkill -f "ss-redir.*$SS_REDIR_PORT" 2>/dev/null || true
+        sleep 2
+    done
+
+    echo "[ERROR] ss-redir failed to start — see $log_file"
+    [[ -f "$log_file" ]] && tail -5 "$log_file" >&2 || true
+    return 1
 }
 
 describe_mode() {

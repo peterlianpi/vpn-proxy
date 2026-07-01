@@ -61,7 +61,7 @@ install_tree() {
     fi
 
     chmod +x "${INSTALL_DIR}/proxy.sh" "${INSTALL_DIR}/install.sh" \
-        "${INSTALL_DIR}/lib/log.sh" 2>/dev/null || true
+        "${INSTALL_DIR}/lib/log.sh" "${INSTALL_DIR}/lib/wait-network.sh" 2>/dev/null || true
     [[ -f "${INSTALL_DIR}/decode-key.sh" ]] && chmod +x "${INSTALL_DIR}/decode-key.sh"
     [[ -f "${INSTALL_DIR}/warp-setup.sh" ]] && chmod +x "${INSTALL_DIR}/warp-setup.sh"
     vp_ok "Files installed to ${INSTALL_DIR}"
@@ -78,18 +78,25 @@ install_systemd() {
     cat >"${SYSTEMD_UNIT}" <<UNIT
 [Unit]
 Description=Outline VPN transparent proxy
-After=network-online.target
+Documentation=https://github.com/peterlianpi/vpn-proxy
+After=network-online.target nss-lookup.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=${INSTALL_DIR}
+RuntimeDirectory=vpn-proxy
 Environment=VP_LOG_DIR=${LOG_DIR}
+ExecStartPre=${INSTALL_DIR}/lib/wait-network.sh
 ExecStart=${BIN_LINK} start
 ExecStop=${BIN_LINK} stop
-TimeoutStartSec=90
+TimeoutStartSec=180
 TimeoutStopSec=45
+Restart=on-failure
+RestartSec=15
 
 [Install]
 WantedBy=multi-user.target
@@ -167,8 +174,13 @@ main() {
     echo "  vpn-proxy logs -f"
     echo "  systemctl enable vpn-proxy"
     echo ""
+    local version_tag
+    version_tag="$(git -C "${INSTALL_DIR}" describe --tags --abbrev=0 2>/dev/null || echo main)"
     echo "One-line install for others:"
     echo "  curl -fsSL https://raw.githubusercontent.com/peterlianpi/vpn-proxy/main/install.sh | sudo bash"
+    if [[ "${version_tag}" != "main" ]]; then
+        echo "  curl -fsSL https://raw.githubusercontent.com/peterlianpi/vpn-proxy/${version_tag}/install.sh | sudo bash"
+    fi
 }
 
 main "$@"
