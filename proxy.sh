@@ -57,6 +57,10 @@ ROOT_ACTIVE_MODE_FILE="${VPN_PROXY_ACTIVE_MODE_FILE:-/run/vpn-proxy/active-mode}
 # later in parse_args() and always wins over this value, which in turn
 # wins over the PROXY_MODE set in config.sh.
 PROXY_MODE="${PROXY_MODE:-selective}"
+# Set the moment a mode arrives on the command line. `start full` must keep
+# beating everything else — including a start-request file left by an earlier
+# delegation — so the request is only honoured when no CLI mode was given.
+PROXY_MODE_FROM_CLI=0
 RUNTIME_EXCLUDES=()
 CMD=""
 
@@ -110,10 +114,12 @@ parse_args() {
         case "$1" in
             full|local|selective)
                 PROXY_MODE="$1"
+                PROXY_MODE_FROM_CLI=1
                 shift
                 ;;
             --mode)
                 PROXY_MODE="${2:?--mode requires full, local, or selective}"
+                PROXY_MODE_FROM_CLI=1
                 shift 2
                 ;;
             --domains-file)
@@ -146,14 +152,16 @@ parse_args() {
 }
 
 require_root() {
-    if [[ $EUID -ne 0 ]]; then
+    if ! have_root; then
         echo "[ERROR] '$1' needs root for iptables. Run: sudo $0 $*"
         exit 1
     fi
 }
 
 have_root() {
-    [[ $EUID -eq 0 ]]
+    # VP_ASSUME_ROOT is a documented TEST SEAM only: the sandbox harnesses
+    # fake privilege instead of using it. Production never sets it.
+    [[ $EUID -eq 0 || "${VP_ASSUME_ROOT:-0}" == "1" ]]
 }
 
 # Can this invocation actually READ the iptables rules? Only root or a
@@ -164,6 +172,149 @@ can_verify_rules() {
         return 0
     fi
     sudo -n true >/dev/null 2>&1
+}
+
+# --- systemd delegation -------------------------------------------------
+# `sudo vpn-proxy start` used to run `nohup ss-redir … &` from the user's
+# terminal. That child inherits the terminal's *session* cgroup, so when the
+# terminal closes logind reaps the whole session — and the proxy dies with no
+# error anywhere. The fix is not "nohup harder", it is to put ss-redir inside
+# /system.slice/vpn-proxy.service, where systemd (and the watchdog timer)
+# own it. To do that, `start` must stop doing the work itself when a loaded
+# unit points at THIS script, and hand the job to systemd instead.
+VP_UNIT="${VP_UNIT:-vpn-proxy.service}"
+# /run/systemd/system is the canonical place systemd keeps its own live
+# unit tree. A host that has no systemd (container, WSL) has no such dir,
+# which is a cheap and reliable "there is no PID 1 supervisor" probe.
+VP_SYSTEMD_DIR="${VP_SYSTEMD_DIR:-/run/systemd/system}"
+# The unit's ExecStart path, used to prove the unit would run THIS file and
+# not some other checkout of it.
+VP_UNIT_EXEC="${VP_UNIT_EXEC:-/usr/local/bin/vpn-proxy}"
+# How long a written start-request stays valid. `systemctl start` cannot pass
+# argv, so the requested mode and excludes travel in a file; the TTL makes a
+# request that was never consumed (crash, failed start) expire instead of
+# silently re-applying an old mode on a later boot.
+VP_REQUEST_TTL="${VP_REQUEST_TTL:-300}"
+REQUEST_FILE="${VP_REQUEST_FILE:-$PID_DIR/start-request}"
+
+# Am I already running INSIDE the systemd unit? Two independent guards,
+# because either alone can be wrong:
+#   VP_SYSTEMD=1  — set by Environment= in the unit file. Survives a systemd
+#                   version that forgets to export INVOCATION_ID.
+#   INVOCATION_ID — set by systemd for every unit process. Survives a unit
+#                   file that predates Environment= (i.e. an old install on
+#                   disk that was never re-copied).
+# Without BOTH guards the two paths can recurse forever: proxy.sh calls
+# systemctl, whose ExecStart calls proxy.sh, which calls systemctl…
+in_systemd_unit() {
+    [[ "${VP_SYSTEMD:-0}" == "1" || -n "${INVOCATION_ID:-}" ]]
+}
+
+unit_load_state() {
+    systemctl show -p LoadState --value "$VP_UNIT" 2>/dev/null || true
+}
+
+# 'loaded' is the only state that means systemd can actually start it.
+# 'masked' / 'not-found' / '' all mean: take the direct path.
+# The unit tree check is the belt to that braces: a host with no systemd at
+# all (container, WSL) has no /run/systemd/system, and asking `systemctl`
+# there is at best noise.
+unit_available() {
+    [[ -d "$VP_SYSTEMD_DIR" ]] || return 1
+    [[ "$(unit_load_state)" == "loaded" ]]
+}
+
+unit_is_active() {
+    [[ "$(systemctl is-active "$VP_UNIT" 2>/dev/null || true)" == "active" ]]
+}
+
+# Only delegate to a unit that would run THIS script. If the installed unit
+# points at a different checkout, delegating would start that other copy.
+unit_runs_this_script() {
+    local unit_script
+    unit_script="$(readlink -f "$VP_UNIT_EXEC" 2>/dev/null || true)"
+    [[ -n "$unit_script" && "$unit_script" == "$_script_path" ]]
+}
+
+# Record what the caller asked for, because `systemctl start` cannot forward
+# argv. One KEY=VALUE per line, mode + the possibly-empty exclude list.
+write_start_request() {
+    mkdir -p "$PID_DIR"
+    (
+        umask 077
+        {
+            printf 'ts=%s\n' "$(date +%s)"
+            printf 'mode=%s\n' "$PROXY_MODE"
+            printf 'script=%s\n' "$_script_path"
+            printf 'excludes=%s\n' "${RUNTIME_EXCLUDES[*]-}"
+        } > "$REQUEST_FILE"
+    )
+}
+
+# Read the request back on the in-unit side of the delegation round trip.
+# Consumes the file (single-use). Never trips `set -e` on a short or empty
+# file — a truncated request must degrade to "no request", not abort start.
+read_start_request() {
+    [[ -s "$REQUEST_FILE" ]] || return 1
+
+    local ts mode excludes line key value
+    ts="" mode="" excludes=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        key="${line%%=*}"
+        value="${line#*=}"
+        case "$key" in
+            ts)       ts="$value" ;;
+            mode)     mode="$value" ;;
+            excludes) excludes="$value" ;;
+        esac
+    done < "$REQUEST_FILE"
+
+    if [[ -z "$ts" || -z "$mode" ]]; then
+        rm -f "$REQUEST_FILE"
+        return 1
+    fi
+    if (( $(date +%s) - ts > VP_REQUEST_TTL )); then
+        rm -f "$REQUEST_FILE"
+        return 1
+    fi
+
+    # The delegation round trip is `systemctl start` -> ExecStart with NO argv,
+    # so PROXY_MODE_FROM_CLI is 0 here and the request supplies the mode.
+    # A mode given on THIS command line always wins, even over a request.
+    if [[ "$PROXY_MODE_FROM_CLI" -eq 0 ]]; then
+        case "$mode" in
+            full|local|selective) PROXY_MODE="$mode" ;;
+            *) rm -f "$REQUEST_FILE"; return 1 ;;
+        esac
+    fi
+    if [[ -n "$excludes" ]]; then
+        read -r -a RUNTIME_EXCLUDES <<< "$excludes"
+    fi
+    rm -f "$REQUEST_FILE"
+    return 0
+}
+
+# All live ss-redir PIDs for our port, one per line. Every decision about
+# "is the proxy running" and "who is supervising it" goes through this.
+ss_redir_pids() {
+    pgrep -f "ss-redir.*$SS_REDIR_PORT" 2>/dev/null || true
+}
+
+# Which cgroup owns the listener: vpn-proxy / manual / none.
+# /proc/<pid>/cgroup is world-readable, so this needs no sudo and a plain
+# `vpn-proxy status` can tell supervised from unsupervised for itself.
+ss_redir_supervision() {
+    local pid found=""
+    while read -r pid; do
+        [[ -n "$pid" ]] || continue
+        found="$found $pid"
+        if [[ -r "/proc/$pid/cgroup" ]] \
+           && grep -q "$VP_UNIT" "/proc/$pid/cgroup" 2>/dev/null; then
+            echo "vpn-proxy"
+            return 0
+        fi
+    done <<< "$(ss_redir_pids)"
+    [[ -n "$found" ]] && echo "manual" || echo "none"
 }
 
 iptables_active() {
@@ -439,7 +590,7 @@ ensure_pid_dir() {
 }
 
 ss_redir_running() {
-    pgrep -f "ss-redir.*$SS_REDIR_PORT" >/dev/null
+    [[ -n "$(ss_redir_pids)" ]]
 }
 
 stop_ss_redir() {
@@ -503,17 +654,38 @@ start_ss_redir() {
     mkdir -p "$(dirname "$log_file")" 2>/dev/null || true
     attempts="${SS_START_ATTEMPTS:-5}"
 
+    # setsid puts the child in a brand-new session with NO controlling
+    # terminal, so closing this terminal no longer gets it reaped. It is a
+    # fallback, not a guarantee: logind only reaps the *session* cgroup of
+    # the caller, so this keeps the process alive — but nothing restarts it
+    # and `systemctl status vpn-proxy` still cannot see it. Only delegation
+    # to the unit gives that, which is why cmd_start tries it first.
+    local setsid_bin=""
+    if [[ "${VP_NO_SETSID:-0}" != "1" ]]; then
+        setsid_bin="$(command -v setsid || true)"
+    fi
+
     echo "[..] Starting ss-redir (transparent proxy) on :$SS_REDIR_PORT ..."
     while (( attempts-- > 0 )); do
-        nohup ss-redir -s "$SS_SERVER" -p "$SS_PORT" \
+        nohup ${setsid_bin:+"$setsid_bin"} ss-redir -s "$SS_SERVER" -p "$SS_PORT" \
                        -l "$SS_REDIR_PORT" \
                        -k "$SS_PASSWORD" \
                        -m "$SS_METHOD" \
                        --no-delay >>"$log_file" 2>&1 &
-        pid=$!
-        echo "$pid" > "$PIDFILE_SS_REDIR"
+        # setsid FORKS when it has a controlling terminal (an interactive
+        # shell), so $! is the short-lived setsid parent, NOT ss-redir.
+        # The pidfile must therefore never record $!: it is resolved from
+        # the real, surviving listener after it is confirmed alive.
         sleep 3
-        if kill -0 "$pid" 2>/dev/null && ss_redir_running; then
+        pid=""
+        local candidate
+        while read -r candidate; do
+            [[ -n "$candidate" ]] || continue
+            pid="$candidate"
+            break
+        done <<< "$(ss_redir_pids)"
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            echo "$pid" > "$PIDFILE_SS_REDIR"
             echo "[OK] ss-redir started (pid=$pid)"
             return 0
         fi
@@ -537,6 +709,51 @@ describe_mode() {
 
 # --- Start ---
 cmd_start() {
+    # (1) Non-root refuses BEFORE anything is created. This check used to
+    # live after start_ss_redir, so a plain `vpn-proxy start` really did
+    # fork an ss-redir, write a pidfile into $XDG_RUNTIME_DIR, and only
+    # then exit 1 on the root check — an orphan listener with no rules,
+    # unsupervised and invisible to `systemctl status`.
+    if ! have_root; then
+        echo "[ERROR] 'start' needs root: it writes iptables rules and owns /run/vpn-proxy."
+        if unit_available; then
+            echo "        Fix: sudo systemctl start $VP_UNIT"
+        else
+            echo "        Fix: sudo $0 start ${PROXY_MODE}"
+        fi
+        echo "        A plain start here would leave an unsupervised ss-redir behind,"
+        echo "        which dies silently when this session closes. Nothing was created."
+        exit 1
+    fi
+
+    # (2) Delegate to systemd when a loaded unit runs THIS script. This is
+    # the path that makes `sudo vpn-proxy start` durable: the unit's
+    # ExecStart re-enters this same script, now inside the unit's cgroup.
+    # Placed before every spawn/write so this run creates nothing itself.
+    if ! in_systemd_unit && unit_available && unit_runs_this_script; then
+        write_start_request
+        # Drop any leftover ss-redir from an earlier unsupervised direct
+        # start: it would keep :$SS_REDIR_PORT bound and make the unit's own
+        # ss-redir fail to bind.
+        stop_ss_redir
+        if systemctl start "$VP_UNIT"; then
+            echo "[OK] $VP_UNIT started, supervised, watchdog armed"
+            rm -f "$REQUEST_FILE"
+            return 0
+        fi
+        # Never fall back silently: a silently-unsupervised proxy is the
+        # exact failure this whole path exists to remove.
+        rm -f "$REQUEST_FILE"
+        echo "[ERROR] systemctl start $VP_UNIT failed — NOT falling back to an unsupervised start."
+        echo "        Inspect: journalctl -u $VP_UNIT -n 30"
+        return 1
+    fi
+
+    # (3) In-unit invocation (or a host with no unit to delegate to): pick
+    # the requested mode back up from the delegation request file, so
+    # `sudo vpn-proxy start full` still takes effect across the round trip.
+    read_start_request || true
+
     # Check the toolchain BEFORE anything starts: a missing ipset in
     # selective mode must not leave an orphan ss-redir listening with no
     # rules behind it.
@@ -546,7 +763,12 @@ cmd_start() {
 
     start_ss_redir
 
-    require_root "start"
+    # Supervise the truth: a listener started from a terminal is not owned by
+    # anything, so say so out loud on every direct (non-unit) start.
+    if ! in_systemd_unit; then
+        echo "[WARN] Not supervised by systemd — this ss-redir dies when this session closes."
+        echo "       Fix: sudo systemctl start $VP_UNIT"
+    fi
 
     if [[ "$PROXY_MODE" == "selective" ]]; then
         echo "[..] Resolving domains from $DOMAINS_FILE ..."
@@ -571,6 +793,22 @@ cmd_start() {
 
 # --- Stop ---
 cmd_stop() {
+    # Delegate to the unit when one owns this script and is ACTIVE.
+    # Stopping ss-redir from here instead would leave the unit
+    # `active (exited)`, and vpn-proxy-watchdog.timer would faithfully
+    # restart the proxy the user just asked to stop.
+    if have_root && ! in_systemd_unit && unit_available \
+       && unit_runs_this_script && unit_is_active; then
+        if systemctl stop "$VP_UNIT"; then
+            echo "[OK] $VP_UNIT stopped — watchdog will not restart it"
+            echo ""
+            echo "    Internet is now DIRECT (no proxy)"
+            return 0
+        fi
+        echo "[ERROR] systemctl stop $VP_UNIT failed — inspect: journalctl -u $VP_UNIT -n 30"
+        return 1
+    fi
+
     local rules_removed=false
 
     if have_root; then
@@ -607,6 +845,24 @@ cmd_status() {
         echo "  ss-redir  : RUNNING  (:$SS_REDIR_PORT -> $SS_SERVER:$SS_PORT)"
     else
         echo "  ss-redir  : STOPPED"
+    fi
+
+    # Supervision truth, readable without root: /proc/<pid>/cgroup is 0444.
+    local supervision unit_state
+    supervision="$(ss_redir_supervision)"
+    case "$supervision" in
+        vpn-proxy)
+            echo "  supervision: $VP_UNIT (systemd, watchdog-protected)"
+            ;;
+        *)
+            echo "  supervision: NONE — unsupervised; dies when its session closes."
+            echo "                Fix: sudo systemctl start $VP_UNIT"
+            ;;
+    esac
+    if unit_state="$(systemctl is-active "$VP_UNIT" 2>/dev/null)" && [[ -n "$unit_state" ]]; then
+        echo "  unit      : ${unit_state}"
+    else
+        echo "  unit      : UNKNOWN (not readable without privileges)"
     fi
 
     local tproxy_active=false
@@ -680,6 +936,22 @@ cmd_refresh() {
 
 # --- Reload (restart) ---
 cmd_reload() {
+    # Same delegation contract as cmd_stop: a reload must go through the
+    # unit, otherwise the stop half would leave an active-but-dead unit for
+    # the watchdog to "fix" on the next tick.
+    if have_root && ! in_systemd_unit && unit_available \
+       && unit_runs_this_script && unit_is_active; then
+        write_start_request
+        if systemctl restart "$VP_UNIT"; then
+            echo "[OK] $VP_UNIT restarted, supervised, watchdog armed"
+            rm -f "$REQUEST_FILE"
+            return 0
+        fi
+        rm -f "$REQUEST_FILE"
+        echo "[ERROR] systemctl restart $VP_UNIT failed — inspect: journalctl -u $VP_UNIT -n 30"
+        return 1
+    fi
+
     cmd_stop
     echo ""
     if have_root; then
