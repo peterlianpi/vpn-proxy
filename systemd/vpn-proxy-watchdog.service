@@ -1,0 +1,27 @@
+[Unit]
+Description=Outline VPN proxy watchdog (self-heal check)
+Documentation=https://github.com/peterlianpi/vpn-proxy
+After=vpn-proxy.service
+
+[Service]
+# Runs /opt/vpn-proxy/lib/watchdog.sh, which restarts vpn-proxy ONLY when
+# the unit is active but its payload is dead.
+#
+# An intentional `systemctl stop vpn-proxy` is never undone: the script
+# exits 0 when vpn-proxy is not active, and re-checks immediately before
+# restarting. Requires=/PartOf= are deliberately NOT used here — a stop
+# dependency would either kill the watchdog's own systemctl client or make
+# this unit fail every minute once vpn-proxy is in `failed` state. The
+# timer is therefore not bound to vpn-proxy's lifecycle either: it stays
+# armed across stops so a later `systemctl start vpn-proxy` is watched
+# immediately.
+Type=oneshot
+WorkingDirectory=/opt/vpn-proxy
+Environment=VP_LOG_DIR=/var/log/vpn-proxy
+ExecStart=/opt/vpn-proxy/lib/watchdog.sh
+TimeoutStartSec=180
+
+[Install]
+# Deliberately empty: the watchdog is pulled in by vpn-proxy-watchdog.timer,
+# which in turn is pulled in by vpn-proxy.service (Wants=). Enabling
+# `vpn-proxy` is enough; there is nothing to enable for this unit.

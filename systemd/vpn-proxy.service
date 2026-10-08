@@ -1,12 +1,22 @@
 [Unit]
 Description=Outline VPN transparent proxy
 Documentation=https://github.com/peterlianpi/vpn-proxy
-After=network-online.target nss-lookup.target
+After=network-online.target nss-lookup.target vpn-proxy-watchdog.timer
 Wants=network-online.target
+Wants=vpn-proxy-watchdog.timer
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
+# oneshot + RemainAfterExit: proxy.sh backgrounds ss-redir, records a
+# pidfile and returns. systemd then reports `active (exited)` forever,
+# which is why Restart=on-failure below almost never fires — a start that
+# succeeded once is never retried. Self-healing therefore lives in
+# vpn-proxy-watchdog.timer, which restarts this unit if ss-redir, the
+# nat SS_REDIR jump or the selective ipset dies while the unit is active.
+# Type=simple is NOT used: proxy.sh forks ss-redir and returns, so
+# systemd would see the main process exit immediately and (with
+# Restart=always) storm-restart the unit.
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/opt/vpn-proxy
@@ -21,4 +31,6 @@ Restart=on-failure
 RestartSec=15
 
 [Install]
+# WantedBy=multi-user.target brings this unit in on boot. The
+# Wants=vpn-proxy-watchdog.timer above pulls the watchdog timer in with it.
 WantedBy=multi-user.target
