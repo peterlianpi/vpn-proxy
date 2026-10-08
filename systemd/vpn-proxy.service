@@ -29,10 +29,20 @@ RuntimeDirectory=vpn-proxy
 # every stop and an unclean stop erases the only evidence of what was live.
 RuntimeDirectoryPreserve=yes
 Environment=VP_LOG_DIR=/var/log/vpn-proxy
+# VP_SYSTEMD=1 is proxy.sh's recursion guard. Without it, `sudo vpn-proxy
+# start` (which now delegates to `systemctl start vpn-proxy`) would make the
+# ExecStart below re-delegate to systemctl, forever. With it, the in-unit
+# run does the work itself. proxy.sh checks BOTH this and INVOCATION_ID, so
+# an older unit file that predates this line is still guarded by systemd's
+# own INVOCATION_ID. Do not remove it.
+Environment=VP_SYSTEMD=1
 ExecStartPre=/opt/vpn-proxy/lib/wait-network.sh
 ExecStart=/usr/local/bin/vpn-proxy start
 ExecStop=/usr/local/bin/vpn-proxy stop
-TimeoutStartSec=180
+# A delegated `start` first waits for DNS (ExecStartPre), then starts
+# ss-redir and resolves domains.txt into ipset; at boot with a slow link
+# that is easily over three minutes.
+TimeoutStartSec=300
 TimeoutStopSec=45
 Restart=on-failure
 RestartSec=15
