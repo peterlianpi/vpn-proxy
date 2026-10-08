@@ -63,6 +63,7 @@ install_tree() {
     chmod +x "${INSTALL_DIR}/proxy.sh" "${INSTALL_DIR}/install.sh" \
         "${INSTALL_DIR}/lib/log.sh" "${INSTALL_DIR}/lib/wait-network.sh" 2>/dev/null || true
     [[ -f "${INSTALL_DIR}/decode-key.sh" ]] && chmod +x "${INSTALL_DIR}/decode-key.sh"
+    [[ -f "${INSTALL_DIR}/set-key.sh" ]] && chmod +x "${INSTALL_DIR}/set-key.sh"
     [[ -f "${INSTALL_DIR}/warp-setup.sh" ]] && chmod +x "${INSTALL_DIR}/warp-setup.sh"
     vp_ok "Files installed to ${INSTALL_DIR}"
 }

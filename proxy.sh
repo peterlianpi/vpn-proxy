@@ -52,7 +52,7 @@ CMD=""
 
 usage() {
     cat <<EOF
-Usage: $0 {start|stop|restart|status|refresh} [options]
+Usage: $0 {start|stop|restart|status|refresh|set-key} [options]
 
 Commands:
   start     Start ss-redir and apply iptables rules
@@ -60,6 +60,7 @@ Commands:
   restart   stop then start
   status    Show process, routing mode, and public IP
   refresh   Re-resolve domains.txt into ipset (selective mode)
+  set-key   Decode and apply a new ss:// access key (config + restart)
   logs      Show log file (e.g. logs -f, logs -n 200)
 
 Routing modes (config: PROXY_MODE, override on CLI):
@@ -677,6 +678,10 @@ case "$CMD" in
     stop)    cmd_stop ;;
     restart|reload) cmd_reload ;;
     refresh) cmd_refresh ;;
+    set-key)
+        shift || true
+        exec "$SCRIPT_DIR/set-key.sh" "$@"
+        ;;
     status)  cmd_status ;;
     *)
         usage
