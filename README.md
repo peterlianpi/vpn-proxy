@@ -26,7 +26,9 @@ vpn-proxy/
 │   ├── wait-network.sh    # Boot-time DNS/network wait (ExecStartPre)
 │   └── watchdog.sh        # Self-heal check (restart if ss-redir/iptables/ipset died)
 ├── tests/
-│   └── sandbox/status-degrade.sh  # Non-root honesty checks for status/stop
+│   └── sandbox/
+│       ├── status-degrade.sh      # Non-root honesty checks for status/stop
+│       └── start-delegate.sh      # start delegates to systemd (or warns)
 ├── warp-setup.sh          # Register WARP through this proxy
 ├── systemd/
 │   ├── vpn-proxy.service              # Auto-start on boot
@@ -123,12 +125,67 @@ Set the persisted default in `config.sh`: `PROXY_MODE="selective"` (shipped),
 
 | Command | Without sudo | With sudo |
 |---------|--------------|-----------|
-| `start` | Starts `ss-redir`, then asks for sudo for iptables | Full start |
-| `stop` | Stops user `ss-redir`; warns the rules could not be verified | Full stop |
-| `restart` | Restarts `ss-redir` only if rules can be verified | Full restart |
-| `status` | Shows process, mode file and IP check; mode is `UNKNOWN` without root | Shows exact iptables mode |
+| `start` | **Refuses**, before creating anything, and says how to start it supervised | Hands off to `systemctl start vpn-proxy` |
+| `stop` | Stops user `ss-redir`; warns the rules could not be verified | Stops the unit if it is active, otherwise removes the rules directly |
+| `restart` | Restarts `ss-redir` only if rules can be verified | Restarts the unit |
+| `status` | Shows process, mode file, **supervision** and IP check; mode is `UNKNOWN` without root | Shows exact iptables mode |
 
 **Important:** `./proxy.sh stop` without sudo can leave iptables redirecting to a dead port and break connectivity. Always run `sudo ./proxy.sh stop` when the proxy was started with sudo.
+
+#### How `start` works
+
+`sudo vpn-proxy start` **does not start ss-redir itself.** It writes the
+requested mode to a short-lived request file and runs `systemctl start
+vpn-proxy`. The unit's `ExecStart` then runs `vpn-proxy start` again — this
+time inside the unit — and *that* run starts ss-redir, so the listener ends
+up in `/system.slice/vpn-proxy.service`, watched by the watchdog timer.
+
+Why this matters: the old implementation ran `nohup ss-redir … &` from your
+terminal. That child inherits your **session** cgroup, so closing the
+terminal makes `logind` reap the whole session — and the proxy dies with no
+error anywhere. `systemctl status vpn-proxy` never saw it either.
+
+Because `systemctl start` cannot pass argv, the requested mode and any
+`--exclude CIDR` travel in the request file instead. It is stamped with a
+timestamp and expires after 300 seconds, so a request that was never
+consumed cannot silently re-apply an old mode on a later boot. An explicit
+mode on the command line still wins over the file.
+
+Delegation needs a unit that actually runs *this* script. If the unit is
+missing, masked, or points at a different checkout, `start` takes the
+**direct path** instead: it launches `setsid ss-redir …`, which at least
+keeps the listener out of your session cgroup, and says plainly:
+
+```
+[OK] ss-redir started (pid=1234)
+[WARN] Not supervised by systemd — this ss-redir dies when this session closes.
+       Fix: sudo systemctl start vpn-proxy.service
+```
+
+`setsid` forks in an interactive shell, so the pid that `$!` returns is the
+short-lived `setsid` parent. `proxy.sh` therefore resolves the real listener
+PID after startup and only then writes the pidfile — the recorded PID is
+always the live `ss-redir`.
+
+Recursion is guarded twice: `Environment=VP_SYSTEMD=1` in the unit file, and
+systemd's own `INVOCATION_ID`. Either one alone is enough to stop the
+in-unit run from calling `systemctl` again.
+
+#### `start` without sudo refuses, and creates nothing
+
+```console
+$ vpn-proxy start
+[ERROR] 'start' needs root: it writes iptables rules and owns /run/vpn-proxy.
+        Fix: sudo systemctl start vpn-proxy.service
+        A plain start here would leave an unsupervised ss-redir behind,
+        which dies silently when this session closes. Nothing was created.
+$ echo $?
+1
+```
+
+Before, the root check happened *after* the spawn: the command really did
+start an `ss-redir`, wrote a pidfile, and only then failed on `iptables` —
+an orphan listener with no rules, invisible to `systemctl`.
 
 #### Status without root says UNKNOWN, never "direct"
 
@@ -143,6 +200,9 @@ $ vpn-proxy status                     # no sudo
 === Outline VPN Proxy Status ===
 
   ss-redir  : RUNNING  (:10800 -> proxy.example.com:47266)
+  supervision: NONE — unsupervised; dies when its session closes.
+                Fix: sudo systemctl start vpn-proxy.service
+  unit      : active
   TPROXY    : UNKNOWN  (ss-redir running — sudo /opt/vpn-proxy/proxy.sh status for rule details)
 
   [!] iptables rules cannot be read without root, so routing is UNKNOWN.
@@ -155,6 +215,23 @@ $ vpn-proxy status                     # no sudo
 
 The same holds for `stop` and `restart`: when the rules cannot be verified
 they say so rather than reporting a clean, direct connection.
+
+#### Supervision is reported even without root
+
+`/proc/<pid>/cgroup` is world-readable, so `status` can always tell whether
+the listener is inside `vpn-proxy.service` — no sudo needed. A listener
+outside the unit is reported as `NONE`, with the fix, instead of looking
+identical to a healthy one:
+
+```
+$ vpn-proxy status
+  ss-redir  : RUNNING  (:10800 -> proxy.example.com:47266)
+  supervision: NONE — unsupervised; dies when its session closes.
+                Fix: sudo systemctl start vpn-proxy.service
+```
+
+Once started through the unit, the same line reads
+`supervision: vpn-proxy.service (systemd, watchdog-protected)`.
 
 A root-started proxy writes its mode to `/run/vpn-proxy/active-mode`.
 `RuntimeDirectoryPreserve=yes` keeps that file across a stop (a clean stop
@@ -294,6 +371,16 @@ sudo systemctl enable --now vpn-proxy.service vpn-proxy-watchdog.timer
 `vpn-proxy.service` carries `Wants=vpn-proxy-watchdog.timer`, so
 `systemctl enable vpn-proxy` alone is enough to get self-healing as well.
 
+Once installed, `sudo vpn-proxy start` and `sudo systemctl start vpn-proxy`
+are the same thing: the first delegates to the second, which is what keeps
+`ss-redir` inside the unit's cgroup. See [How `start` works](#how-start-works).
+
+```bash
+sudo vpn-proxy start        # == systemctl start vpn-proxy (supervised)
+sudo vpn-proxy stop         # == systemctl stop vpn-proxy when active
+systemctl show -p Environment vpn-proxy   # confirm VP_SYSTEMD=1
+```
+
 ## Self-Heal (Watchdog)
 
 `vpn-proxy.service` is `Type=oneshot` + `RemainAfterExit=yes`: `proxy.sh`
@@ -335,6 +422,7 @@ triggering a restart every 60 seconds that no restart could ever fix.
 
 ```bash
 bash tests/sandbox/status-degrade.sh        # or: ./tests/sandbox/status-degrade.sh
+bash tests/sandbox/start-delegate.sh         # or: ./tests/sandbox/start-delegate.sh
 echo $?                                     # 0 = all assertions passed
 ```
 
@@ -350,12 +438,42 @@ that:
 3. with a working `sudo`, a fake `SS_REDIR` chain carrying
    `match-set vpn_proxy_domains` is reported as `ACTIVE (mode=selective)`;
 4. a world-readable `/run/vpn-proxy/active-mode` is honoured with no sudo at
-   all.
+   all;
+5. `status` prints a `supervision:` line and never regresses to
+   `INACTIVE (direct connection)`.
 
-It touches nothing on the host — every path is a `mktemp` directory, and
-`VPN_PROXY_ACTIVE_MODE_FILE` repoints the one absolute path `proxy.sh` reads —
-and it must be run **as a non-root user** (it fakes privilege rather than
-using it). It needs `config.sh` to exist, but never prints the `ss://` key.
+`tests/sandbox/start-delegate.sh` guards the supervision contract. It fakes
+`systemctl` (including actually running the unit's `ExecStart` the way
+systemd would), `setsid`, `ss-redir`, `ipset`, `iptables` and `sudo`, and
+asserts that:
+
+1. a non-root `start` exits 1 with the right hint and creates **nothing** —
+   no listener, no pidfile, no ipset, no request file;
+2. root + a loaded unit results in exactly one `systemctl start` and zero
+   direct spawns;
+3. the delegated start really runs the unit, and the in-unit run makes **zero**
+   `systemctl` calls (no ExecStart↔systemctl recursion) — with `VP_SYSTEMD=1`
+   and with `INVOCATION_ID` alone;
+4. `start full` and `--exclude` survive the round trip through the request
+   file, and a stale request older than the TTL is discarded;
+5. a masked unit, a missing `/run/systemd/system` or a unit running a
+   different script falls back to the direct path, where the **pidfile holds
+   the real `ss-redir` PID**, not `setsid`'s short-lived parent;
+6. `stop` with an active unit only calls `systemctl stop`, so the watchdog
+   cannot resurrect the proxy;
+7. a failing `systemctl start` is loud and never falls back silently.
+
+Both harnesses run the real `proxy.sh` as your own user against a private
+copy with a placeholder key and a unique `SS_REDIR_PORT`, so a production
+`ss-redir` on the host is never matched or killed.
+
+Both harnesses touch nothing on the host — every path is a `mktemp`
+directory, and `VPN_PROXY_ACTIVE_MODE_FILE` repoints the one absolute path
+`proxy.sh` reads — and both must be run **as a non-root user** (they fake
+privilege rather than using it, via the `VP_ASSUME_ROOT` seam).
+`start-delegate.sh` needs `config.sh` to exist only to read its mode; it
+runs a private copy with a placeholder key and a unique `SS_REDIR_PORT`, and
+never prints the `ss://` key.
 
 ## Using with WARP
 
@@ -384,6 +502,11 @@ With WARP + VPN:
 | Symptom | Likely cause | Fix |
 |---------|----------------|-----|
 | `Permission denied` on `/run/vpn-proxy/` | Ran `start` without sudo after a sudo start | `sudo ./proxy.sh stop` then `sudo ./proxy.sh start` |
+| `supervision: NONE` in `status` | `ss-redir` was started from a terminal, not by the unit — it dies when that terminal closes | `sudo systemctl start vpn-proxy` |
+| `ss-redir` dies when the terminal closes | Started outside the unit, so it inherited the session cgroup | `sudo systemctl start vpn-proxy`, then confirm `systemctl status vpn-proxy` |
+| `'start' needs root` | Plain `vpn-proxy start` | `sudo systemctl start vpn-proxy` (nothing was created) |
+| `[WARN] Not supervised by systemd` | No usable unit, so `start` took the direct `setsid` path | `sudo systemctl start vpn-proxy` |
+| `systemctl start … failed — NOT falling back` | The unit refused to start; there is no silent unsupervised proxy by design | `journalctl -u vpn-proxy -n 30` |
 | `TPROXY : UNKNOWN` | Rules cannot be read without root — this is *not* "direct" | `sudo vpn-proxy status` |
 | IP check `(timeout)` after `stop` | iptables still redirecting, `ss-redir` dead | `sudo ./proxy.sh stop` |
 | `start` succeeds but IP unchanged | Outline server down | `nc -zv <server> <port>` |
@@ -396,6 +519,7 @@ With WARP + VPN:
 ## Requirements
 
 - `shadowsocks-libev` (`ss-redir`, `ss-local`)
+- `util-linux` (`setsid`, used only on the direct, non-systemd start path)
 - `iptables`, `ip` (iproute2)
 - `ipset` (for selective mode)
 - `dig` or `getent` for DNS resolution

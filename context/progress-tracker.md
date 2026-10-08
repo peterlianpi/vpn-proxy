@@ -211,6 +211,116 @@ installed on this host and was **not** run.
 `config.sh` and `domains.txt` from its sync, and the `cmp` byte-parity check on
 installed units is intact.
 
+## Phase 3 — supervision: `start` delegates to systemd (2026-10-09)
+
+### Root cause
+
+`sudo vpn-proxy start` ran `nohup ss-redir … &` **from the user's
+terminal**. That child inherits the terminal's *session* cgroup, so when the
+terminal closes `logind` reaps the whole session — and `ss-redir` dies with
+no error in any log. `systemctl status vpn-proxy` never saw the process
+either, because it was never in the unit's cgroup. `nohup` only ignores
+`SIGHUP`; it does nothing about a session-wide reap, which is why adding it
+changed nothing. The watchdog could not save it either: the watchdog checks
+*health*, and an actively-working-but-unsupervised proxy looks healthy.
+
+The same ordering bug had a second face: `require_root "start"` sat
+*after* `start_ss_redir`, so a plain `vpn-proxy start` really did fork a
+listener and write a pidfile, and only then exited 1 on the root check.
+
+### Delegation decision
+
+`start` now hands the whole job to the unit instead of doing it:
+
+```
+sudo vpn-proxy start
+  → write /run/vpn-proxy/start-request   (mode + excludes, umask 077, 300s TTL)
+  → drop any unsupervised leftover ss-redir
+  → systemctl start vpn-proxy.service
+       → ExecStart: proxy.sh start   (VP_SYSTEMD=1, inside the unit cgroup)
+            → read_start_request, then start ss-redir as before
+```
+
+- **Delegation conditions:** root, not already in the unit, `LoadState ==
+  loaded`, and the unit's `ExecStart` resolves to *this* script. A masked
+  unit, a missing `/run/systemd/system`, or a unit pointing at another
+  checkout all take the direct path instead — delegation to the wrong script
+  would be worse than no delegation.
+- **Recursion is guarded twice**, independently: `Environment=VP_SYSTEMD=1`
+  (survives a systemd that does not export `INVOCATION_ID`) and
+  `INVOCATION_ID` (survives a unit file predating the `Environment=` line).
+  Either alone is sufficient. Without them, `ExecStart` → `systemctl` →
+  `ExecStart` would never terminate.
+- **A request file, because `systemctl start` cannot pass argv.** Mode and
+  `--exclude` values travel as `KEY=VALUE` lines under `umask 077`. The 300 s
+  timestamp TTL means a request that was never consumed (crash, failed
+  start) expires instead of re-applying an old mode after a reboot. An
+  explicit CLI mode still wins over the file (`PROXY_MODE_FROM_CLI`).
+- **`stop` and `restart` delegate too.** Stopping `ss-redir` directly would
+  leave the unit `active (exited)` and the watchdog would faithfully
+  resurrect the proxy the operator just stopped.
+- **Failure is never silent.** A failed `systemctl start` prints the error,
+  the journal hint, removes the request file and returns 1. There is no
+  unsupervised fallback — an unsupervised proxy that claims to be running is
+  the exact failure this phase removes.
+
+### `setsid` fallback (the direct path)
+
+When there is no usable unit, the listener is launched as
+`nohup ${setsid_bin} ss-redir …`, which puts it in a session with no
+controlling terminal. That is a mitigation, not supervision: logind no
+longer reaps it with your session, but nothing restarts it and systemd still
+cannot see it. The path therefore always prints
+`[WARN] Not supervised by systemd … Fix: sudo systemctl start vpn-proxy`.
+
+`setsid` **forks** when it has a controlling terminal, so `$!` is the
+short-lived parent. The pidfile used to record `$!`, which was wrong on both
+the old and the new path. It is now resolved from `ss_redir_pids()` after
+the process is confirmed alive, so the recorded PID is always the live
+`ss-redir`.
+
+### `status` gained supervision truth
+
+`ss_redir_supervision()` greps `/proc/<pid>/cgroup` — world-readable, so no
+sudo — and reports `vpn-proxy.service (systemd, watchdog-protected)` or
+`NONE — unsupervised; dies when its session closes` plus the fix, along with
+a `unit:` line. The Phase 2 invariant is preserved: the `unknown` mode branch
+and its `[!]` block are untouched, and `INACTIVE (direct connection)` is
+still never printed for merely unverifiable rules.
+
+### Decisions from this phase
+
+- **A process that nothing supervises must say so out loud.** Every direct
+  start warns; a non-root `status` can prove supervision without privilege.
+- **Refuse before creating, not after.** The non-root `start` check is the
+  first statement in `cmd_start` — no pidfile, no ipset, no orphan listener.
+- **The root check and the delegation check are both seams for tests.**
+  `have_root()` accepts `VP_ASSUME_ROOT=1`; `require_root()` now calls
+  `have_root()` so both agree. Production never sets it.
+- **The watchdog's intentional-stop guard is untouched** —
+  `lib/watchdog.sh` is not modified by this phase.
+
+### Verification
+
+- `bash -n` on `proxy.sh`, `install.sh`, `lib/*.sh`, `tests/sandbox/*.sh` — clean.
+- `tests/sandbox/start-delegate.sh` — **64 assertions, all passing**; **30 of
+  them fail** against `HEAD:proxy.sh` (checked out and re-run), including the
+  exact leak this fixes: pre-change output is
+  `[OK] ss-redir started (pid=…)` *followed by* `[ERROR] 'start' needs root`.
+- `tests/sandbox/status-degrade.sh` — **24 assertions, all passing**
+  (the 17 existing ones unchanged, plus 7 new supervision assertions).
+- `systemd-analyze verify` on all three units — clean.
+- `git diff --check` — clean. No occurrence of the real SS password in the
+  diff (checked programmatically against `/opt/vpn-proxy/config.sh`).
+
+### Not changed (deliberately)
+
+`install.sh` (still never overwrites the live `config.sh` key or
+`domains.txt`, unit `cmp` byte-parity intact), `lib/watchdog.sh`,
+`set-key.sh`, `config.sh.example`, `domains.txt` and `domains.txt.example`
+(still exactly 8 active entries). Mode precedence is CLI > `config.sh` >
+built-in `selective`, with the request file inserted strictly below CLI.
+
 ## System Design Checklist
 
 Refer to `architecture.md` > System Design & Infrastructure
