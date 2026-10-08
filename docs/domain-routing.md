@@ -1,13 +1,19 @@
 # Routing Specific Domains Only
 
-Transparent proxy (`ss-redir` + iptables) matches **IP addresses**, not hostnames. To proxy only Google AI Studio, Facebook, or other sites, you must either use a **browser SOCKS proxy** or build **domain → IP → ipset** routing.
+Transparent proxy (`ss-redir` + iptables) matches **IP addresses**, not hostnames. To proxy only the GitHub API, Facebook, or other sites, you must either use a **browser SOCKS proxy** or build **domain → IP → ipset** routing.
+
+> **`selective` is the shipped default.** `config.sh.example` sets
+> `PROXY_MODE="selective"` and `proxy.sh` falls back to `selective` when
+> `PROXY_MODE` is unset, so a fresh install proxies only what is listed in
+> `domains.txt`. `full` and `local` remain available on demand — see
+> [Switching to full tunnel](#switching-to-full-tunnel).
 
 ## Quick comparison
 
 | Approach | Scope | Complexity | Best for |
 |----------|-------|------------|----------|
-| SOCKS + browser extension | Browser only | Low | AI Studio, Facebook in Chrome/Firefox |
-| `selective` mode (ipset) | System-wide TCP | Medium | Specific apps hitting known domains |
+| `selective` mode (ipset) | System-wide TCP | Medium | **Default** — specific apps hitting known domains |
+| SOCKS + browser extension | Browser only | Low | Facebook in Chrome/Firefox only |
 | dnsmasq + ipset | System-wide TCP | High | Many domains, IPs change often |
 
 ---
@@ -62,12 +68,40 @@ Route only traffic to IPs that belong to listed domains. Built into `proxy.sh` v
 
 ### Setup
 
+`selective` is already the default, so on a fresh install you only need the
+domain list:
+
 ```bash
-cp domains-myanmar.txt.example domains.txt   # full Myanmar list (recommended)
-# or: cp domains.txt.example domains.txt    # minimal starter
-nano domains.txt                             # trim or add domains
 sudo apt install ipset
+cat domains.txt                    # shipped list: GitHub API + Facebook family
+sudo ./proxy.sh start              # selective, because PROXY_MODE defaults to it
+```
+
+Explicitly, or with a different list:
+
+```bash
+cp domains.txt.example domains.txt                      # curated starter list
+# cp domains-myanmar.txt.example domains.txt            # broad Myanmar list
+nano domains.txt
 sudo ./proxy.sh start selective
+```
+
+### Switching to full tunnel
+
+Every mode stays runnable on demand — the CLI flag wins over `config.sh`, which
+wins over the built-in default:
+
+```bash
+sudo ./proxy.sh start full         # all TCP through the tunnel, for now
+sudo ./proxy.sh start local        # only this machine's TCP (OUTPUT)
+sudo ./proxy.sh start selective    # back to the domain list
+```
+
+To make it stick across restarts, edit `PROXY_MODE` in the live config:
+
+```bash
+sudo sed -i 's/^PROXY_MODE=.*/PROXY_MODE="full"/' /opt/vpn-proxy/config.sh
+sudo systemctl restart vpn-proxy
 ```
 
 ### How it works
@@ -83,7 +117,74 @@ domains.txt  →  dig/resolve  →  ipset (vpn_proxy_domains)  →  iptables  �
 
 ### Example domain list
 
-See `domains.txt.example` for Google AI Studio and Facebook entries.
+The shipped `domains.txt.example` contains only what is **blocked or
+geo-restricted** on the network it was built for. On the network this project
+was tuned against, that is:
+
+| Group | Entries | Why |
+|-------|---------|-----|
+| GitHub REST API | `api.github.com` | The API is TCP-blocked, but git clone, raw content and release downloads over `github.com` work fine direct and stay fast |
+| Facebook family | `facebook.com`, `www.facebook.com`, `graph.facebook.com`, `upload.facebook.com`, `developers.facebook.com`, `fbcdn.net`, `fb.com` | The whole family is TCP-blocked direct |
+
+Google / googleapis / gstatic / googleusercontent / aistudio.google.com are
+**not** in the active list. They were verified to reach the internet fine
+direct from this host, so proxying them is pure latency and CDN risk. They sit
+in a clearly marked commented-out "OPTIONAL / geo-restricted" block at the
+bottom of the file — uncomment the ones you need if you move to a network
+where they are blocked.
+
+Nothing from npm, PyPI, Go, Maven, crates.io, Docker Hub, jsdelivr, cdnjs,
+unpkg, esm.sh, RubyGems or Anaconda belongs in this list. All of them are fast
+direct, and proxying them breaks the assumption that a proxied request is
+rare.
+
+### The literal-FQDN caveat
+
+**This list is resolved with `dig +short A <name>`. An apex name does NOT cover
+its subdomains.**
+
+`facebook.com` in `domains.txt` adds facebook.com's own A records and nothing
+else. `graph.facebook.com`, `upload.facebook.com` and `static.fbcdn.net` are
+separate DNS names and each needs its own line. This is why the shipped list
+enumerates every Facebook host explicitly rather than relying on the apex, and
+why `.facebook.com` syntax (which ipset-style wildcard matching would use) does
+not work here.
+
+Same reasoning applies to `fbcdn.net` — `scontent.fbcdn.net` and friends are
+distinct names.
+
+### Never add
+
+| Domain | Why |
+|--------|-----|
+| `fonts.npmjs.com` | DNS **NXDOMAIN** — there is no A record to resolve, so it can never be proxied |
+| `packagist.org` | Resolves IPv6-only on this network; resolution yields no usable IPv4, so it silently never enters the ipset |
+
+### Self-heal (watchdog)
+
+`selective` mode depends on three pieces of live state: the `ss-redir` process,
+the `nat OUTPUT -> SS_REDIR` jump, and the `ipset` itself. If any of them dies,
+`domains.txt` looks correct but nothing is proxied.
+
+`vpn-proxy.service` is `Type=oneshot` + `RemainAfterExit=yes`, so systemd reports
+`active (exited)` forever and `Restart=on-failure` never fires (it only applies
+to a unit that *failed*). `vpn-proxy-watchdog.timer` closes that gap: every 60
+seconds `lib/watchdog.sh` checks all three and runs `systemctl restart vpn-proxy`
+if any is missing.
+
+An intentional `systemctl stop vpn-proxy` is never undone — the watchdog exits
+when the unit is not active and re-checks immediately before restarting.
+
+```bash
+systemctl status vpn-proxy-watchdog.timer
+journalctl -u vpn-proxy-watchdog.service -n 20
+sudo /opt/vpn-proxy/lib/watchdog.sh   # manual check
+```
+
+Also relevant to selective mode: the ipset has `IPSET_TIMEOUT=3600`, and a
+background job re-resolves every `DOMAIN_REFRESH_INTERVAL=300` seconds. If that
+job dies, IPs age out of the set and domains start going direct — which is
+exactly what the watchdog's ipset check catches.
 
 ### Config (`config.sh`)
 
@@ -94,10 +195,15 @@ See `domains.txt.example` for Google AI Studio and Facebook entries.
 | `IPSET_TIMEOUT` | `3600` | IP entry lifetime (seconds) |
 | `DOMAIN_REFRESH_INTERVAL` | `300` | Auto re-resolve interval |
 | `SELECTIVE_SCOPE` | `local` | `local` = this machine only; `full` = forwarded traffic too |
+| `PROXY_MODE` | `selective` | Shipped default; `full` and `local` override via CLI or this key |
 
 ### Caveats
 
-- **Google / Facebook use many CDN IPs** — include related domains (`googleapis.com`, `fbcdn.net`, etc.).
+- **Literal FQDNs only** — an apex name does not cover subdomains (see above).
+- **Use many CDN hostnames** — Facebook and Google serve content from many
+  distinct hostnames, each of which must be listed separately.
+- **Only list what is blocked** — a domain that works direct gains nothing from
+  being proxied.
 - **First request** to a new subdomain may go direct until the next refresh.
 - **UDP/QUIC** (e.g. HTTP/3) is not handled by `ss-redir` (TCP only).
 - Some apps use hardcoded IPs and bypass DNS.
@@ -118,6 +224,10 @@ done
 # In SS_REDIR chain, only redirect if dst in set:
 iptables -t nat -A SS_REDIR -m set --match-set vpn_proxy_domains dst -p tcp -j REDIRECT --to-ports 10800
 ```
+
+Note the per-domain `dig` loop above: each name is resolved on its own, exactly
+as `proxy.sh` does. There is no wildcard or suffix matching anywhere in this
+approach.
 
 Use `sudo ./proxy.sh stop` before experimenting so you do not stack conflicting rules.
 
@@ -154,10 +264,11 @@ iptables then matches `-m set --match-set vpn_proxy_domains dst` as in Option 2.
 
 | Goal | Use |
 |------|-----|
-| Only AI Studio / Facebook in browser | **Option 1** — SOCKS + SwitchyOmega |
+| Only the listed domains (default behaviour) | **Option 2** — nothing to do; `sudo ./proxy.sh start` is already `selective` |
 | Listed domains, system-wide (apps) | **Option 2** — `sudo ./proxy.sh start selective` |
+| Facebook in the browser only, no system changes | **Option 1** — SOCKS + SwitchyOmega |
 | Many domains, DNS-driven | **Option 3** — dnsmasq + ipset |
-| Everything through VPN | `sudo ./proxy.sh start` (full) |
+| Everything through VPN | `sudo ./proxy.sh start full` |
 | Only this machine's apps, all TCP | `sudo ./proxy.sh start local` |
 
-See [README](../README.md) for `full` / `local` modes and `sudo ./proxy.sh help`.
+See [README](../README.md) for the routing-mode table, switching to `full`, and `sudo ./proxy.sh help`.
