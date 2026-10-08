@@ -21,6 +21,13 @@ Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/opt/vpn-proxy
 RuntimeDirectory=vpn-proxy
+# Keep /run/vpn-proxy across a stop. A CLEAN stop already deletes
+# active-mode (clean_tproxy -> clear_active_mode), so a surviving file means
+# the stop did not run to completion — a crash, a kill -9, a failed
+# ExecStop. That is exactly the case where status and the watchdog need to
+# read the last known mode. Without this, systemd deletes the directory on
+# every stop and an unclean stop erases the only evidence of what was live.
+RuntimeDirectoryPreserve=yes
 Environment=VP_LOG_DIR=/var/log/vpn-proxy
 ExecStartPre=/opt/vpn-proxy/lib/wait-network.sh
 ExecStart=/usr/local/bin/vpn-proxy start
