@@ -91,7 +91,7 @@ Persistently, for good or until you change it back:
 
 ```bash
 sudo sed -i 's/^PROXY_MODE=.*/PROXY_MODE="full"/' /opt/vpn-proxy/config.sh
-sudo systemctl restart vpn-proxy     # or: sudo systemctl restart vpn-proxy-watchdog.timer
+sudo systemctl restart vpn-proxy
 ```
 
 Back to selective:

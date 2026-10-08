@@ -100,11 +100,13 @@ install_tree() {
     backup_file "${INSTALL_DIR}/domains.txt" bak
 
     if command -v rsync >/dev/null 2>&1; then
-        # config.sh is excluded outright so the live key material can never
-        # be clobbered, and backups are excluded so --delete keeps them.
+        # Live operator state (config.sh, domains.txt) is excluded outright
+        # so hand-edited lists and key material can never be clobbered, and
+        # backups are excluded so --delete keeps them.
         rsync -a --delete \
             --exclude '.git/' \
             --exclude '/config.sh' \
+            --exclude '/domains.txt' \
             --exclude 'config.sh.bak*' \
             --exclude 'domains.txt.bak*' \
             "${src}/" "${INSTALL_DIR}/"
