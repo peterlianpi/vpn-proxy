@@ -164,6 +164,120 @@ ensure_proxy_mode() {
     vp_ok "Routing mode switch: sudo vpn-proxy start full | local | selective"
 }
 
+# --- Dependency preflight --------------------------------------------------
+# Runs after ensure_proxy_mode (so PROXY_MODE is settled) and BEFORE any unit
+# or symlink is written. Failing here leaves the machine untouched; failing
+# later leaves a half-installed proxy that only breaks at first start.
+#
+# Note config.sh holds the ss:// key, so the mode is read with grep, never
+# sourced.
+
+os_family() {
+    local id="" id_like=""
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        id="$(. /etc/os-release 2>/dev/null && printf '%s' "${ID:-}")"
+        id_like="$(. /etc/os-release 2>/dev/null && printf '%s' "${ID_LIKE:-}")"
+    fi
+    case " ${id} ${id_like} " in
+        *" debian "*|*" ubuntu "*) echo debian ;;
+        *" fedora "*|*" rhel "*|*" centos "*) echo fedora ;;
+        *" arch "*) echo arch ;;
+        *" suse "*) echo suse ;;
+        *) echo unknown ;;
+    esac
+}
+
+install_hint() {
+    local pkg="$1"
+    case "$(os_family)" in
+        debian) echo "sudo apt-get install -y ${pkg}" ;;
+        fedora) echo "sudo dnf install -y ${pkg}" ;;
+        arch)   echo "sudo pacman -S ${pkg}" ;;
+        suse)   echo "sudo zypper install -y ${pkg}" ;;
+        *)      echo "install the '${pkg}' package with your package manager" ;;
+    esac
+}
+
+# Effective mode from the installed config.sh, without evaluating it.
+effective_proxy_mode() {
+    local cfg="${INSTALL_DIR}/config.sh"
+    local mode="$DEFAULT_PROXY_MODE"
+    local line=""
+    if [[ -f "$cfg" ]]; then
+        line="$(grep -E '^[[:space:]]*PROXY_MODE=' "$cfg" 2>/dev/null | tail -n 1 || true)"
+        if [[ "$line" =~ ^[[:space:]]*PROXY_MODE=[\"']?([A-Za-z]+)[\"']?([[:space:]]*#.*)?$ ]]; then
+            mode="${BASH_REMATCH[1]}"
+        fi
+    fi
+    echo "$mode"
+}
+
+require_bin() {
+    local cmd="$1" pkg="$2" why="$3"
+    command -v "$cmd" >/dev/null 2>&1 && return 0
+    vp_err "Missing dependency: ${cmd} — ${why}"
+    vp_err "  Install: $(install_hint "$pkg")"
+    return 1
+}
+
+preflight_deps() {
+    vp_step "Checking dependencies"
+
+    local mode
+    mode="$(effective_proxy_mode)"
+    vp_ok "Effective PROXY_MODE: ${mode} (from ${INSTALL_DIR}/config.sh)"
+
+    # Hard requirements. Every mode needs these; without them proxy.sh
+    # cannot start at all, so there is no point installing units.
+    local missing=0
+    require_bin iptables iptables "every mode rewrites iptables rules" || missing=1
+    require_bin ss-redir shadowsocks-libev \
+        "ss-redir is the transparent proxy binary shipped by the shadowsocks-libev package" \
+        || missing=1
+    require_bin dig dnsutils \
+        "DNS lookups resolve the server address and the domains.txt list" \
+        || missing=1
+    if ((missing > 0)); then
+        vp_err "Install the packages above (Debian/Ubuntu use bind-utils' equivalent 'dnsutils'), then re-run: sudo ./install.sh"
+        exit 1
+    fi
+
+    # curl is only used for the public-IP check in `status`.
+    if ! command -v curl >/dev/null 2>&1; then
+        vp_warn "curl not found — 'vpn-proxy status' will show '(timeout)' for the IP check."
+        vp_warn "  Install: $(install_hint curl)"
+    fi
+
+    # ipset is required only by selective mode; elsewhere it is a warning.
+    if command -v ipset >/dev/null 2>&1; then
+        vp_ok "Dependencies present: iptables, ss-redir, dig, ipset"
+        return 0
+    fi
+
+    if [[ "$mode" != "selective" ]]; then
+        vp_warn "ipset not found — not needed for PROXY_MODE=${mode}, but 'sudo vpn-proxy start selective' would fail without it."
+        vp_warn "  Install: $(install_hint ipset)"
+        return 0
+    fi
+
+    vp_warn "ipset not found and PROXY_MODE=${mode} — selective mode cannot resolve domains.txt without it."
+    if command -v apt-get >/dev/null 2>&1; then
+        vp_step "Installing ipset with apt-get"
+        if DEBIAN_FRONTEND=noninteractive apt-get install -y ipset; then
+            vp_ok "Installed ipset"
+            return 0
+        fi
+        vp_err "apt-get could not install ipset."
+    else
+        vp_err "ipset is missing and this host has no apt-get to install it with."
+    fi
+
+    vp_err "Install ipset manually, then re-run: sudo ./install.sh"
+    vp_err "  Install: $(install_hint ipset)"
+    exit 1
+}
+
 install_bin_link() {
     vp_step "Linking ${BIN_LINK}"
     ln -sf "${INSTALL_DIR}/proxy.sh" "${BIN_LINK}"
@@ -297,6 +411,7 @@ main() {
     require_root
     clone_if_piped
     ensure_proxy_mode
+    preflight_deps
     install_bin_link
     install_systemd
     enable_systemd
