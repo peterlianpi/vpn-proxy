@@ -76,7 +76,8 @@ active_mode() {
     if [[ -r "$PIDFILE_ACTIVE_MODE" ]]; then
         cat "$PIDFILE_ACTIVE_MODE" 2>/dev/null && return
     fi
-    sudo -n cat "$PIDFILE_ACTIVE_MODE" 2>/dev/null && return
+    # No sudo fallback: the watchdog runs as root under
+    # vpn-proxy-watchdog.service, so an unreadable file means it is gone.
     echo "${PROXY_MODE:-unknown}"
 }
 
@@ -99,7 +100,10 @@ health=()
 ss_redir_running || health+=("ss-redir not running on :$SS_REDIR_PORT")
 nat_rules_ok   || health+=("nat OUTPUT -> SS_REDIR rule missing")
 if [[ "$(active_mode)" == "selective" ]]; then
-    if ! ipset list "$IPSET_NAME" &>/dev/null; then
+    # `command -v ipset` guards the check: on a host without ipset a missing
+    # set is not evidence of a degraded proxy, and treating it as one would
+    # restart the unit every 60s forever — a loop no restart can satisfy.
+    if ! ipset list "$IPSET_NAME" &>/dev/null && command -v ipset >/dev/null 2>&1; then
         health+=("ipset $IPSET_NAME missing (selective mode)")
     fi
 fi
