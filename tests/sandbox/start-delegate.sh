@@ -270,7 +270,7 @@ teardown_sandbox() {
     [[ -n "$p" ]] && kill "$p" 2>/dev/null
     if [[ -n "${SS_PID_FILE:-}" && -f "$SS_PID_FILE" ]]; then
         p="$(cat "$SS_PID_FILE" 2>/dev/null || true)"
-        [[ -n "$p" ]] && kill "$p" 2>/dev/null || true
+        if [[ -n "$p" ]]; then kill "$p" 2>/dev/null || true; fi
     fi
     if [[ -n "${SANDBOX_DIR:-}" && -d "$SANDBOX_DIR" ]]; then
         # Scoped to this sandbox's own binary path, so a REAL ss-redir on
@@ -404,8 +404,11 @@ assert_contains "$out" "Not supervised by systemd" "direct start warns it is uns
 assert_contains "$out" "sudo systemctl start vpn-proxy.service" "direct start names the fix"
 assert_eq "$(count_calls '^systemctl \(start\|stop\|restart\) ')" "0" "no systemctl action with a masked unit"
 assert_file_present "${SANDBOX_DIR}/xdg/vpn-proxy/ss-redir.pid" "the direct path wrote a pidfile"
-[[ -n "$real_pid" ]] && ok "the fake ss-redir really is running (pid resolved)" \
-                    || bad "no live ss-redir to compare the pidfile against"
+if [[ -n "$real_pid" ]]; then
+    ok "the fake ss-redir really is running (pid resolved)"
+else
+    bad "no live ss-redir to compare the pidfile against"
+fi
 assert_eq "$pidfile" "$real_pid" "pidfile PID == the real ss-redir, not setsid's parent"
 teardown_sandbox
 echo
@@ -492,8 +495,11 @@ assert_contains "$out" "journalctl -u vpn-proxy.service -n 30" "the failure poin
 assert_eq "$(count_calls '^ss-redir ')" "0" "no unsupervised ss-redir spawned as a 'fix'"
 assert_eq "$(count_calls '^ipset ')" "0" "no ipset work as a 'fix'"
 assert_file_absent "$REQUEST" "the request file is cleaned up on failure"
-[[ "$rc" -ne 0 ]] && ok "start exits non-zero when systemctl fails" \
-                 || bad "start should exit non-zero when systemctl fails (got ${rc})"
+if [[ "$rc" -ne 0 ]]; then
+    ok "start exits non-zero when systemctl fails"
+else
+    bad "start should exit non-zero when systemctl fails (got ${rc})"
+fi
 teardown_sandbox
 echo
 
