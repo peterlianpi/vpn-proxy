@@ -46,6 +46,12 @@ PIDFILE_SS_LOCAL="$PID_DIR/ss-local.pid"
 PIDFILE_DOMAIN_REFRESH="$PID_DIR/domain-refresh.pid"
 PIDFILE_ACTIVE_MODE="$PID_DIR/active-mode"
 
+# Where a root-run instance (the systemd unit) records its mode.
+# RuntimeDirectory=vpn-proxy creates /run/vpn-proxy as 0755, so this file
+# is world-readable and a non-root `status` can read it with no sudo at all.
+# The override exists so the sandbox tests can point it somewhere hermetic.
+ROOT_ACTIVE_MODE_FILE="${VPN_PROXY_ACTIVE_MODE_FILE:-/run/vpn-proxy/active-mode}"
+
 # Shipped default is 'selective' (only domains.txt is proxied).
 # A CLI mode (proxy.sh start full|local|selective, or --mode) is parsed
 # later in parse_args() and always wins over this value, which in turn
@@ -150,6 +156,16 @@ have_root() {
     [[ $EUID -eq 0 ]]
 }
 
+# Can this invocation actually READ the iptables rules? Only root or a
+# working `sudo -n` can. Without one of those, every rule query returns
+# "not found", which would be reported as a confident "no rules" — a lie.
+can_verify_rules() {
+    if have_root; then
+        return 0
+    fi
+    sudo -n true >/dev/null 2>&1
+}
+
 iptables_active() {
     if have_root; then
         iptables -t mangle -L SS_TPROXY -n 2>/dev/null | grep -q TPROXY \
@@ -157,7 +173,11 @@ iptables_active() {
         return
     fi
 
-    # Non-root: iptables -L often fails; check jump rules via sudo -n if allowed
+    # Non-root: iptables -L needs root, so only probe when sudo really works.
+    if ! can_verify_rules; then
+        return 1
+    fi
+
     if sudo -n iptables -t mangle -C PREROUTING -p tcp -j SS_TPROXY 2>/dev/null; then
         return 0
     fi
@@ -174,23 +194,15 @@ detect_proxy_mode() {
     fi
 
     if ! have_root; then
-        if sudo -n test -f "$PIDFILE_ACTIVE_MODE" 2>/dev/null; then
-            sudo -n cat "$PIDFILE_ACTIVE_MODE"
+        # Read the root-run state file directly — it is world-readable, so
+        # this needs no sudo. The old `sudo -n test/cat/iptables` probes could
+        # never succeed here and only turned "cannot check" into a confident
+        # "none", which is what made a live proxy look INACTIVE.
+        if [[ -r "$ROOT_ACTIVE_MODE_FILE" ]]; then
+            cat "$ROOT_ACTIVE_MODE_FILE"
             return
         fi
-        if sudo -n iptables -t mangle -C PREROUTING -p tcp -j SS_TPROXY 2>/dev/null; then
-            echo "full"
-            return
-        fi
-        if sudo -n iptables -t nat -L SS_REDIR -n 2>/dev/null | grep -q "match-set $IPSET_NAME"; then
-            echo "selective"
-            return
-        fi
-        if sudo -n iptables -t nat -C OUTPUT -p tcp -j SS_REDIR 2>/dev/null; then
-            echo "local"
-            return
-        fi
-        echo "none"
+        echo "unknown"
         return
     fi
 
@@ -525,6 +537,13 @@ describe_mode() {
 
 # --- Start ---
 cmd_start() {
+    # Check the toolchain BEFORE anything starts: a missing ipset in
+    # selective mode must not leave an orphan ss-redir listening with no
+    # rules behind it.
+    if [[ "$PROXY_MODE" == "selective" ]]; then
+        require_ipset
+    fi
+
     start_ss_redir
 
     require_root "start"
@@ -559,20 +578,23 @@ cmd_stop() {
         clean_tproxy
         rules_removed=true
         echo "[OK] TPROXY rules removed"
-    elif iptables_active; then
+    elif can_verify_rules && iptables_active; then
         echo "[WARN] iptables rules still active — run: sudo $0 stop"
     fi
 
     stop_ss_redir
     echo "[OK] ss-redir stopped"
 
-    if ! $rules_removed && iptables_active; then
+    if $rules_removed; then
+        echo ""
+        echo "    Internet is now DIRECT (no proxy)"
+    elif iptables_active; then
         echo ""
         echo "    [WARN] Traffic may still be redirected to :$SS_REDIR_PORT (no listener)"
         echo "    Fix: sudo $0 stop"
     else
         echo ""
-        echo "    Internet is now DIRECT (no proxy)"
+        echo "    WARN Could not verify iptables without root — traffic may STILL be redirected. Run: sudo $0 stop"
     fi
 }
 
@@ -604,15 +626,25 @@ cmd_status() {
             tproxy_active=true
             mode_label="ACTIVE   (mode=selective — listed domains via proxy)"
             ;;
+        unknown)
+            mode_label="UNKNOWN  (cannot verify without root — re-run: sudo $0 status)"
+            ;;
         *)
             mode_label="INACTIVE (direct connection)"
             ;;
     esac
-    if [[ "$active_mode" == "none" ]] && ss_redir_running; then
+    if [[ "$active_mode" == "none" || "$active_mode" == "unknown" ]] && ss_redir_running; then
         mode_label="UNKNOWN  (ss-redir running — sudo $0 status for rule details)"
         tproxy_active=true
     fi
     echo "  TPROXY    : $mode_label"
+
+    if [[ "$active_mode" == "unknown" ]]; then
+        echo ""
+        echo "  [!] iptables rules cannot be read without root, so routing is UNKNOWN."
+        echo "      UNKNOWN is NOT 'direct' — traffic may still be redirected."
+        echo "      Verify with: sudo $0 status"
+    fi
 
     if [[ "$active_mode" == "selective" ]] && have_root && ipset list "$IPSET_NAME" &>/dev/null; then
         local set_size
@@ -660,6 +692,10 @@ cmd_reload() {
         echo "[OK] ss-redir restarted (iptables rules unchanged)"
         echo ""
         echo "    To change routing mode or refresh rules: sudo $0 start [$PROXY_MODE]"
+    elif ! can_verify_rules; then
+        echo "[ERROR] Could not verify iptables without root — state is UNKNOWN, not 'inactive'."
+        echo "        Re-run with root to reload the routing rules: sudo $0 start [$PROXY_MODE]"
+        exit 1
     else
         echo "[ERROR] iptables not active. Apply rules with: sudo $0 start [$PROXY_MODE]"
         exit 1
