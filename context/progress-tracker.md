@@ -6,6 +6,8 @@ change.
 ## Current Phase
 
 - Phase 1 — selective default, curated domains, self-heal. Complete.
+- Phase 2 — honesty without root, systemd state preservation, dependency
+  preflight, watchdog restart-loop fix. Complete.
 
 ## Current Goal
 
@@ -118,6 +120,96 @@ change.
   key material is never on disk in the replaced state — not even transiently.
 - **Unit files are rendered from `systemd/`, not heredoc'd in `install.sh`.** One
   source of truth; `cmp` proves the installed copy matches the repo copy.
+
+## Phase 2 — honesty without root (2026-10-09)
+
+Four bugs, one atomic commit each, then docs + tests.
+
+### `4a74e8b` fix(proxy): status/stop/reload lie without root
+
+The worst class of proxy bug is a confident wrong answer. A non-root run
+could not read iptables, but `detect_proxy_mode()` still probed with
+`sudo -n test -f` / `sudo -n cat` / `sudo -n iptables` — probes that can never
+succeed without a working passwordless sudo. They always fell through to
+`none`, so a **running** selective proxy reported `INACTIVE (direct
+connection)` and `stop` printed `Internet is now DIRECT (no proxy)` while
+traffic was still being redirected into a dead `ss-redir`.
+
+- `can_verify_rules()` — root, or a `sudo -n` that actually works. It runs
+  `sudo -n true`, not a rule query, so the probe cannot be mistaken for state.
+- `iptables_active()` — non-root returns "not verified" immediately instead of
+  issuing probes that cannot succeed.
+- `detect_proxy_mode()` — dead probes deleted; reads the root-run state file
+  `/run/vpn-proxy/active-mode` directly (`RuntimeDirectory=` makes it 0755, so
+  it is world-readable). Undeterminable non-root → `unknown`, never `none`.
+- `cmd_status()` — `unknown` label + an explicit `[!]` block. The existing
+  ss-redir override now also covers `unknown`.
+- `cmd_stop()` / `cmd_reload()` — unverifiable state is reported as such.
+- `cmd_start()` — `require_ipset` runs **before** `start_ss_redir`, so a
+  missing ipset cannot leave an orphan listener with no rules behind it.
+- `VPN_PROXY_ACTIVE_MODE_FILE` overrides the state-file path (default
+  unchanged) purely so the sandbox tests stay hermetic.
+
+### `1e64041` fix(systemd): RuntimeDirectoryPreserve=yes
+
+A clean stop already deletes `active-mode` in `clean_tproxy`, so systemd
+deleting `/run/vpn-proxy` on every stop also erased the only evidence of what
+was live after an *unclean* stop — exactly when `status` and the watchdog need
+it. `RuntimeDirectoryPreserve=yes` keeps the directory.
+
+### `7c72536` feat(install): dependency preflight
+
+`preflight_deps()` runs after `ensure_proxy_mode` and **before**
+`install_bin_link` / `install_systemd`, so a missing package fails with nothing
+installed. Hard fail on `iptables`, `ss-redir` (named as the
+`shadowsocks-libev` binary it is) and `dig`; `ipset` is fatal only for
+`selective` (auto-installed via `apt-get`, else the exact per-distro command is
+printed); `curl` is a warning. The mode is read from `config.sh` with `grep`,
+never sourced — that file holds the `ss://` key.
+
+### `0f965ec` fix(watchdog): no more 60s restart loop
+
+`active_mode()`'s `sudo -n cat` fallback was dead code (the watchdog is already
+root under the unit). The selective ipset check ran unguarded, so on a host
+without ipset every 60s looked like a degraded proxy and the watchdog restarted
+the unit forever — a loop no restart can satisfy. Now guarded by
+`command -v ipset`, matching how `nat_rules_ok` already treats a missing
+iptables.
+
+### Decisions from this phase
+
+- **"Cannot verify" is a distinct state from "not active".** Reported as
+  `UNKNOWN` in `status`, as an unverifiable warning in `stop`/`reload`, and as
+  `not active` only when root really did look and found nothing.
+- **State files beat privilege escalation for a status read.** The mode file is
+  world-readable by design, so a non-root status reads it directly instead of
+  trying `sudo`. No sudo prompt, no dead probe, no false negative.
+- **The watchdog never judges an uninstalled dependency "unhealthy."** A missing
+  `ipset` binary is a host configuration problem, not a dead proxy; restarting
+  cannot fix it and would fight the operator.
+- **Preflight before mutation, not after.** Failing after the units are written
+  leaves a machine that looks installed and fails at first start.
+
+### Verification
+
+`tests/sandbox/status-degrade.sh` — 17 assertions, all passing; **10 of them
+fail against the pre-fix `proxy.sh`** (verified by checking out `HEAD:proxy.sh`
+and re-running). Plus `bash -n` on every touched script,
+`systemd-analyze verify` on all three units, `git diff --check`, and a
+seven-case matrix over `preflight_deps` (missing iptables / ss-redir / dig /
+ipset-fail / ipset-ok / non-selective / curl-only). `shellcheck` is not
+installed on this host and was **not** run.
+
+### Not changed (deliberately)
+
+`domains.txt` and `domains.txt.example` (still exactly 8 active entries:
+`api.github.com`, `facebook.com`, `www.facebook.com`, `graph.facebook.com`,
+`upload.facebook.com`, `developers.facebook.com`, `fbcdn.net`, `fb.com`),
+`set-key.sh`, `config.sh.example`, `lib/wait-network.sh`, and the
+`apply_tproxy` / `clean_tproxy` rule bodies. `PROXY_MODE` precedence
+(CLI > `config.sh` > default) is untouched, `install.sh` still excludes the live
+`config.sh` and `domains.txt` from its sync, and the `cmp` byte-parity check on
+installed units is intact.
 
 ## System Design Checklist
 

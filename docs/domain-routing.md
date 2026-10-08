@@ -77,6 +77,16 @@ cat domains.txt                    # shipped list: GitHub API + Facebook family
 sudo ./proxy.sh start              # selective, because PROXY_MODE defaults to it
 ```
 
+`ipset` is not optional for this mode, so `install.sh` preflights it: with
+`PROXY_MODE=selective` a missing `ipset` is a hard failure, and the installer
+tries `apt-get install -y ipset` before printing the exact command for your
+distribution. That check runs *before* any unit or symlink is written, so a
+host without `ipset` never gets a half-installed proxy that only fails at first
+start. In `full`/`local` mode a missing `ipset` is only a warning — switching
+to `selective` later would need it. `proxy.sh start` also re-checks ipset
+*before* launching `ss-redir`, so a manual start cannot leave an orphan
+listener with no rules behind it.
+
 Explicitly, or with a different list:
 
 ```bash
@@ -184,7 +194,39 @@ sudo /opt/vpn-proxy/lib/watchdog.sh   # manual check
 Also relevant to selective mode: the ipset has `IPSET_TIMEOUT=3600`, and a
 background job re-resolves every `DOMAIN_REFRESH_INTERVAL=300` seconds. If that
 job dies, IPs age out of the set and domains start going direct — which is
-exactly what the watchdog's ipset check catches.
+exactly what the watchdog's ipset check catches. That check is itself guarded
+by `command -v ipset`, so a host without ipset installed is never judged
+degraded and never restarted every 60 seconds.
+
+### Reading status without root
+
+`vpn-proxy status` needs root to read the iptables rules, so a non-root run
+reports `UNKNOWN`, never `INACTIVE (direct connection)`:
+
+```bash
+vpn-proxy status
+#   TPROXY    : UNKNOWN  (ss-redir running — sudo /opt/vpn-proxy/proxy.sh status for rule details)
+#   [!] iptables rules cannot be read without root, so routing is UNKNOWN.
+#       UNKNOWN is NOT 'direct' — traffic may still be redirected.
+
+sudo vpn-proxy status
+#   TPROXY    : ACTIVE   (mode=selective — listed domains via proxy)
+#   ipset     : vpn_proxy_domains (9 entries)
+```
+
+The second line is the one that matters in `selective` mode: the ipset entry
+count tells you the `domains.txt` → ipset resolution is actually populated.
+If it reads `0 entries`, the domains resolved to nothing and nothing is being
+proxied even though the rules look correct.
+
+A root-started proxy records its mode in `/run/vpn-proxy/active-mode`, which
+`RuntimeDirectoryPreserve=yes` keeps across stops. That file is world-readable,
+so after one `sudo vpn-proxy start` the non-root status can report
+`ACTIVE (mode=selective …)` without sudo — `UNKNOWN` only appears when the
+proxy was never started as root, or `/run` was cleared by a reboot.
+
+`stop` and `restart` follow the same rule: without root they say the rules are
+unverifiable instead of claiming `Internet is now DIRECT (no proxy)`.
 
 ### Config (`config.sh`)
 

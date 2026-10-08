@@ -25,6 +25,8 @@ vpn-proxy/
 │   ├── log.sh             # Logging helpers
 │   ├── wait-network.sh    # Boot-time DNS/network wait (ExecStartPre)
 │   └── watchdog.sh        # Self-heal check (restart if ss-redir/iptables/ipset died)
+├── tests/
+│   └── sandbox/status-degrade.sh  # Non-root honesty checks for status/stop
 ├── warp-setup.sh          # Register WARP through this proxy
 ├── systemd/
 │   ├── vpn-proxy.service              # Auto-start on boot
@@ -122,11 +124,65 @@ Set the persisted default in `config.sh`: `PROXY_MODE="selective"` (shipped),
 | Command | Without sudo | With sudo |
 |---------|--------------|-----------|
 | `start` | Starts `ss-redir`, then asks for sudo for iptables | Full start |
-| `stop` | Stops user `ss-redir`; warns if iptables still active | Full stop |
-| `restart` | Restarts `ss-redir` only if rules already exist | Full restart |
-| `status` | Shows process + IP check | Shows exact iptables mode |
+| `stop` | Stops user `ss-redir`; warns the rules could not be verified | Full stop |
+| `restart` | Restarts `ss-redir` only if rules can be verified | Full restart |
+| `status` | Shows process, mode file and IP check; mode is `UNKNOWN` without root | Shows exact iptables mode |
 
 **Important:** `./proxy.sh stop` without sudo can leave iptables redirecting to a dead port and break connectivity. Always run `sudo ./proxy.sh stop` when the proxy was started with sudo.
+
+#### Status without root says UNKNOWN, never "direct"
+
+`iptables -L` needs root. Without it there is no way to know what the rules
+are, so `proxy.sh` refuses to guess: it reports `UNKNOWN` instead of
+`INACTIVE`. Before, dead `sudo -n iptables` probes always failed and fell
+through to "no rules", so a **running** proxy was reported as
+`INACTIVE (direct connection)` — confident and wrong.
+
+```
+$ vpn-proxy status                     # no sudo
+=== Outline VPN Proxy Status ===
+
+  ss-redir  : RUNNING  (:10800 -> proxy.example.com:47266)
+  TPROXY    : UNKNOWN  (ss-redir running — sudo /opt/vpn-proxy/proxy.sh status for rule details)
+
+  [!] iptables rules cannot be read without root, so routing is UNKNOWN.
+      UNKNOWN is NOT 'direct' — traffic may still be redirected.
+      Verify with: sudo /opt/vpn-proxy/proxy.sh status
+
+--- IP Check ---
+{ "ip": "203.0.113.9", ... }
+```
+
+The same holds for `stop` and `restart`: when the rules cannot be verified
+they say so rather than reporting a clean, direct connection.
+
+A root-started proxy writes its mode to `/run/vpn-proxy/active-mode`.
+`RuntimeDirectoryPreserve=yes` keeps that file across a stop (a clean stop
+already deletes it), so a non-root `status` still reports `ACTIVE
+(mode=selective …)` with no sudo at all once the proxy has been started as
+root. Only a host with a proxy that was never started as root — or whose
+`/run` was cleared by a reboot — needs `sudo`.
+
+```bash
+vpn-proxy status        # UNKNOWN  → re-run: sudo vpn-proxy status
+sudo vpn-proxy status   # ACTIVE (mode=selective — listed domains via proxy)
+```
+
+## Dependency Preflight
+
+`install.sh` checks dependencies **before** it writes anything to the host, so
+a missing package fails with nothing installed instead of leaving units and a
+symlink behind a proxy that cannot start:
+
+| Dependency | If missing |
+|------------|-----------|
+| `iptables`, `ss-redir` (from `shadowsocks-libev`), `dig` | **hard fail** — install, then re-run `sudo ./install.sh` |
+| `ipset` with `PROXY_MODE=selective` | **hard fail** — auto-installed with `apt-get install -y ipset`, or install it yourself and re-run |
+| `ipset` with `full`/`local` | warning only |
+| `curl` | warning only (it is just the public-IP check in `status`) |
+
+The mode is read out of `config.sh` with `grep`, never sourced, because that
+file holds the `ss://` key. Per-distro install commands are printed on failure.
 
 ## Proxy Only Specific Domains
 
@@ -270,6 +326,37 @@ sudo /opt/vpn-proxy/lib/watchdog.sh     # run a check by hand
 sudo systemctl stop vpn-proxy-watchdog.timer   # disable self-heal
 ```
 
+The watchdog runs as root, so it reads the mode file directly — no `sudo`
+probe. It also refuses to call a dependency that is simply not installed
+"unhealthy": if `ipset` is absent, the missing set is ignored rather than
+triggering a restart every 60 seconds that no restart could ever fix.
+
+## Tests
+
+```bash
+bash tests/sandbox/status-degrade.sh        # or: ./tests/sandbox/status-degrade.sh
+echo $?                                     # 0 = all assertions passed
+```
+
+`tests/sandbox/status-degrade.sh` guards the non-root honesty contract. It
+puts a fake `sudo`, `iptables`, `ipset`, `pgrep`, `curl`, `pkill`, `dig` and
+`logger` on `PATH` and runs the real `proxy.sh` as your own user, asserting
+that:
+
+1. with an unusable `sudo` and `ss-redir` running, `status` says `UNKNOWN`
+   and never `INACTIVE (direct connection)` — and says so with no listener too;
+2. `stop` warns that the rules are unverifiable and never claims
+   `Internet is now DIRECT`;
+3. with a working `sudo`, a fake `SS_REDIR` chain carrying
+   `match-set vpn_proxy_domains` is reported as `ACTIVE (mode=selective)`;
+4. a world-readable `/run/vpn-proxy/active-mode` is honoured with no sudo at
+   all.
+
+It touches nothing on the host — every path is a `mktemp` directory, and
+`VPN_PROXY_ACTIVE_MODE_FILE` repoints the one absolute path `proxy.sh` reads —
+and it must be run **as a non-root user** (it fakes privilege rather than
+using it). It needs `config.sh` to exist, but never prints the `ss://` key.
+
 ## Using with WARP
 
 Cloudflare WARP is geo-blocked in some regions. Register/connect through this proxy:
@@ -297,6 +384,7 @@ With WARP + VPN:
 | Symptom | Likely cause | Fix |
 |---------|----------------|-----|
 | `Permission denied` on `/run/vpn-proxy/` | Ran `start` without sudo after a sudo start | `sudo ./proxy.sh stop` then `sudo ./proxy.sh start` |
+| `TPROXY : UNKNOWN` | Rules cannot be read without root — this is *not* "direct" | `sudo vpn-proxy status` |
 | IP check `(timeout)` after `stop` | iptables still redirecting, `ss-redir` dead | `sudo ./proxy.sh stop` |
 | `start` succeeds but IP unchanged | Outline server down | `nc -zv <server> <port>` |
 | `Address already in use` | Lingering `ss-redir` | `sudo pkill -f ss-redir` |
