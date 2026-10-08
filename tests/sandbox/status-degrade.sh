@@ -271,6 +271,28 @@ assert_not_contains "$out" "UNKNOWN" "a readable state file is enough, no sudo n
 echo
 
 # --------------------------------------------------------------------------
+echo "[5] a supervised ss-redir is reported as supervised, not as NONE"
+# The fake pgrep above answers from FAKE_SS_REDIR, so the fake `systemctl`
+# decides the unit state; the cgroup of the (absent) pid never matches the
+# unit, which is exactly the "manual listener" case.
+FAKE_SS_REDIR=1
+out="$(run_proxy sudo-fail status)"
+teardown_sandbox
+assert_contains "$out" "supervision:" "status prints a supervision line"
+assert_contains "$out" "supervision: NONE" "a listener outside the unit is NONE"
+assert_contains "$out" "sudo systemctl start vpn-proxy" "NONE names the fix"
+assert_contains "$out" "unit      :" "status prints the unit state line"
+
+# --------------------------------------------------------------------------
+echo "[6] status still never claims INACTIVE after the supervision lines"
+FAKE_SS_REDIR=0
+out="$(run_proxy sudo-fail status)"
+teardown_sandbox
+assert_contains "$out" "UNKNOWN" "TPROXY is still UNKNOWN, not a lie"
+assert_not_contains "$out" "INACTIVE (direct connection)" "no INACTIVE (direct connection) regression"
+assert_contains "$out" "supervision: NONE" "supervision is reported even with nothing running"
+
+# --------------------------------------------------------------------------
 echo "=== ${PASS} passed, ${FAIL} failed ==="
 [[ "$FAIL" -eq 0 ]] || exit 1
 exit 0
