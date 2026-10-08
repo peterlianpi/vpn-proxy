@@ -23,11 +23,12 @@ SS_SOCKS_PORT=1080     # SOCKS5 proxy (ss-local, optional)
 # Set this to the resolved IP of your SS_SERVER to prevent routing loops
 PROXY_IP=""
 
-# --- Routing mode ---
-# full      = all TCP (forwarded + local apps) — needs sudo
-# local     = only locally-generated TCP (OUTPUT chain) — needs sudo
+# --- Routing mode (default: selective — only domains.txt is proxied) ---
 # selective = only domains in domains.txt (ipset) — needs sudo + ipset
-PROXY_MODE="full"
+# local     = only locally-generated TCP (OUTPUT chain) — needs sudo
+# full      = all TCP (forwarded + local apps) — needs sudo
+# CLI override always wins: sudo ./proxy.sh start full|local|selective
+PROXY_MODE="selective"
 
 # Selective mode: cp domains.txt.example domains.txt
 DOMAINS_FILE="domains.txt"

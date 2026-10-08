@@ -26,10 +26,10 @@ else
 fi
 
 # NOTE: iptables changes require root (sudo). ss-redir can run as your user.
-# Usage: sudo ./proxy.sh start
-#        ./proxy.sh start local          # only this machine's TCP (OUTPUT)
-#        sudo ./proxy.sh start selective   # only domains in domains.txt
-#        ./proxy.sh start --exclude 1.2.3.4/32
+# Usage: sudo ./proxy.sh start selective   # DEFAULT — only domains in domains.txt
+#        sudo ./proxy.sh start full         # all TCP (forwarded + local)
+#        ./proxy.sh start local            # only this machine's TCP (OUTPUT)
+#        sudo ./proxy.sh start --exclude 1.2.3.4/32
 
 IPSET_NAME="${IPSET_NAME:-vpn_proxy_domains}"
 IPSET_TIMEOUT="${IPSET_TIMEOUT:-3600}"
@@ -46,7 +46,11 @@ PIDFILE_SS_LOCAL="$PID_DIR/ss-local.pid"
 PIDFILE_DOMAIN_REFRESH="$PID_DIR/domain-refresh.pid"
 PIDFILE_ACTIVE_MODE="$PID_DIR/active-mode"
 
-PROXY_MODE="${PROXY_MODE:-full}"
+# Shipped default is 'selective' (only domains.txt is proxied).
+# A CLI mode (proxy.sh start full|local|selective, or --mode) is parsed
+# later in parse_args() and always wins over this value, which in turn
+# wins over the PROXY_MODE set in config.sh.
+PROXY_MODE="${PROXY_MODE:-selective}"
 RUNTIME_EXCLUDES=()
 CMD=""
 
@@ -63,10 +67,13 @@ Commands:
   set-key   Decode and apply a new ss:// access key (config + restart)
   logs      Show log file (e.g. logs -f, logs -n 200)
 
-Routing modes (config: PROXY_MODE, override on CLI):
-  full        Proxy all TCP — forwarded + local traffic (default)
+Routing modes (default: config PROXY_MODE, then selective; CLI wins):
+  selective   Proxy only domains listed in domains.txt (ipset) — default
+  full        Proxy all TCP — forwarded + local traffic
   local       Proxy only locally-generated TCP (OUTPUT chain)
-  selective   Proxy only domains listed in domains.txt (ipset)
+
+  Switch on demand:  $0 start full | $0 start local | $0 start selective
+  Persist in config.sh: PROXY_MODE="full"
 
 Options:
   --mode MODE         Routing mode: full | local | selective

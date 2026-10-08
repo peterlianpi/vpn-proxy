@@ -1,18 +1,52 @@
 # Domains to route through the proxy (for ipset / selective routing)
-# Copy ONE of these and edit:
-#   cp domains-myanmar.txt.example domains.txt   # Myanmar censorship + AI geo-blocks (recommended)
-#   cp domains.txt.example domains.txt           # minimal starter list
+# Used by `selective` mode, which is the shipped default (PROXY_MODE in
+# config.sh.example).
 #
-# One domain per line; # comments allowed.
+# One FQDN per line; # comments allowed; blank lines ignored.
+#
+# IMPORTANT — LITERAL NAMES ONLY:
+#   This list is resolved with `dig +short A <name>`. An apex name does
+#   NOT cover its subdomains. "facebook.com" resolves to facebook.com's
+#   A record only; "static.fbcdn.net" is a different name and needs its
+#   own line. Always write the FQDNs you actually need.
+#
+# Only add what is BLOCKED / geo-restricted on this network. Anything
+# that resolves and connects fine direct must stay out of this file —
+# proxying it costs latency and can break CDNs that pin by IP.
+#
+# Alternate lists:
+#   cp domains-myanmar.txt.example domains.txt   # broad Myanmar list
+#
+# NEVER ADD:
+#   fonts.npmjs.com — DNS NXDOMAIN, no A record to resolve.
+#   packagist.org   — IPv6-only here, resolution yields no usable IPv4.
 
-# Google AI Studio (minimal)
-aistudio.google.com
-googleapis.com
-google.com
-gstatic.com
-googleusercontent.com
+# --- Group 1: GitHub REST API -------------------------------------------
+# Why: git clone / raw / release downloads over github.com work fine
+# direct on this network; only the REST API is TCP-blocked. Adding the
+# web apex would route nothing useful and would slow down clones.
+api.github.com
 
-# Facebook (minimal)
+# --- Group 2: Facebook family -------------------------------------------
+# Why: the whole family is TCP-blocked direct. Facebook serves content
+# from many hostnames and each one is resolved literally, so they are
+# listed explicitly rather than relying on the apex.
 facebook.com
+www.facebook.com
+graph.facebook.com
+upload.facebook.com
+developers.facebook.com
 fbcdn.net
 fb.com
+
+# --- Group 3: OPTIONAL / geo-restricted ----------------------------------
+# These resolve and connect fine DIRECT from this host, so they are
+# parked here to keep the default list minimal (smaller ipset, fewer
+# surprises). Uncomment the ones you actually need if you move to a
+# network where they are blocked or geo-restricted (e.g. AI Studio and
+# friends on some ISPs).
+#aistudio.google.com
+#googleapis.com
+#google.com
+#gstatic.com
+#googleusercontent.com
