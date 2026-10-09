@@ -20,6 +20,10 @@
 #   * a direct-path start whose pidfile holds the short-lived setsid parent
 #   * `start full` losing its mode across the delegation round trip
 #   * `stop` leaving the unit active so the watchdog resurrects the proxy
+#   * a redundant `start` killing the healthy supervised ss-redir, which a
+#     `systemctl start` on an ACTIVE oneshot unit cannot replace (see [2b])
+#   * a malformed/empty request file aborting the in-unit start or stranding
+#     /run/vpn-proxy/start-request (see [10b], [10c])
 #
 # Everything is faked on PATH and lives in mktemp dirs; nothing on the
 # host is touched and no credential is ever printed. `pgrep`/`pkill` are
@@ -114,9 +118,18 @@ prepare() {
 
     CALL_LOG="${SANDBOX_DIR}/calls.log"
     SS_PID_FILE="${SANDBOX_DIR}/ss-redir.pid"
+    STATE_FILE="${SANDBOX_DIR}/unit.state"
     REQUEST="${SANDBOX_DIR}/run/vpn-proxy/start-request"
     OUT_FILE="${SANDBOX_DIR}/proxy.out"
     : > "$CALL_LOG"
+
+    # The fake systemctl's notion of unit state. Seeded from the flavour so
+    # every existing scenario starts from the state it used to fake from
+    # the flavour string alone.
+    case "$flavour" in
+        active) echo active > "$STATE_FILE" ;;
+        *)      echo inactive > "$STATE_FILE" ;;
+    esac
 
     # A private COPY of the script, with its own config.sh. Two reasons,
     # both about not lying to the operator:
@@ -150,6 +163,7 @@ EOS
     # Exported for the fakes, which read them at RUN time (their heredocs
     # are quoted, so nothing is baked in at creation time).
     export CALL_LOG SS_PID_FILE
+    export FAKE_STATE_FILE="$STATE_FILE"
     export FAKE_UNIT_FLAVOUR="$flavour"
     case "$flavour" in
         masked) export FAKE_LOAD_STATE="masked" ;;
@@ -170,26 +184,51 @@ EOS
     # With VP_SYSTEMCTL_EXEC=1 it also RUNS the unit's ExecStart the way
     # systemd would (VP_SYSTEMD=1 + INVOCATION_ID), so the delegation round
     # trip is exercised for real instead of mocked.
+    #
+    # It models a Type=oneshot + RemainAfterExit=yes unit with a state
+    # FILE, because that is the whole point: on real systemd `start` on an
+    # already-ACTIVE oneshot unit is a NO-OP — ExecStart is NOT re-run.
+    # An earlier version of this fake always ran ExecStart, so it could not
+    # model the bug this harness now guards (see [2b]).
     cat > "${SANDBOX_DIR}/bin/systemctl" <<'EOS'
 #!/bin/sh
 echo "systemctl $*" >> "$CALL_LOG"
+
+STATE_FILE="$FAKE_STATE_FILE"
+[ -f "$STATE_FILE" ] || echo inactive > "$STATE_FILE"
+unit_state() { cat "$STATE_FILE" 2>/dev/null || echo inactive; }
+
 case "$1" in
     show)
         echo "$FAKE_LOAD_STATE"
         exit 0
         ;;
     is-active)
-        if [ "$FAKE_UNIT_FLAVOUR" = "active" ]; then echo active; exit 0; fi
-        echo inactive; exit 3
+        s="$(unit_state)"
+        [ "$s" = "active" ] && { echo active; exit 0; }
+        echo "$s"
+        exit 3
         ;;
     start|stop|restart)
         [ "${VP_SYSTEMCTL_EXIT:-0}" != "0" ] && exit "$VP_SYSTEMCTL_EXIT"
-        if [ "${VP_SYSTEMCTL_EXEC:-0}" = "1" ]; then
-            cmd=start
-            [ "$1" = "stop" ] && cmd=stop
-            VP_SYSTEMD=1 INVOCATION_ID=fake-invocation \
-                "$FAKE_UNIT_EXEC" "$cmd" >> "$CALL_LOG" 2>&1
+        if [ "$1" = "start" ] && [ "$(unit_state)" = "active" ]; then
+            # REAL systemd: starting an ALREADY-ACTIVE oneshot unit is a
+            # no-op. ExecStart is NOT re-run, so an ss-redir the CLI killed
+            # a moment earlier stays dead.
+            exit 0
         fi
+        job=start
+        [ "$1" = "stop" ] && job=stop
+        if [ "${VP_SYSTEMCTL_EXEC:-0}" = "1" ]; then
+            VP_SYSTEMD=1 INVOCATION_ID=fake-invocation \
+                "$FAKE_UNIT_EXEC" "$job" >> "$CALL_LOG" 2>&1
+            rc=$?
+            [ "$rc" -ne 0 ] && exit "$rc"
+        fi
+        # RemainAfterExit=yes: the unit reads active after a successful
+        # ExecStart, and inactive after a clean ExecStop.
+        if [ "$job" = "stop" ]; then echo inactive > "$STATE_FILE"
+        else echo active > "$STATE_FILE"; fi
         exit 0
         ;;
 esac
@@ -365,6 +404,44 @@ teardown_sandbox
 echo
 
 # --------------------------------------------------------------------------
+echo "[2b] a SECOND start on an already-active unit kills nothing (idempotent)"
+# Regression, and the reason this harness fake exists. Real systemd: `start`
+# on an ACTIVE Type=oneshot + RemainAfterExit=yes unit is a NO-OP — ExecStart
+# is NOT re-run. cmd_start used to call stop_ss_redir BEFORE `systemctl start`
+# on every run, so a redundant `sudo vpn-proxy start` killed the healthy
+# supervised ss-redir, nothing replaced it, and the command still printed
+# "[OK] … started" and exited 0. Reproduced twice against real systemd.
+prepare loaded setsid
+out="$(VP_SYSTEMCTL_EXEC=1 run_proxy yes -- start)"
+first_pid="$(cat "$SS_PID_FILE" 2>/dev/null || true)"
+calls="$(cat "$CALL_LOG")"
+assert_contains "$calls" "[OK] Transparent proxy active" "the first start really ran the unit"
+assert_eq "$(count_calls '^ss-redir ')" "1" "the first start spawned exactly one ss-redir"
+if [[ -n "$first_pid" ]] && kill -0 "$first_pid" 2>/dev/null; then
+    ok "the first ss-redir is live, so there IS something to lose"
+else
+    bad "no live ss-redir after the first start — this test proves nothing"
+fi
+
+out="$(VP_SYSTEMCTL_EXEC=1 run_proxy yes -- start)"
+second_pid="$(cat "$SS_PID_FILE" 2>/dev/null || true)"
+assert_contains "$out" "already active — nothing to do" "the redundant start says it did nothing"
+assert_not_contains "$out" "started, supervised" "it does not claim to have started anything"
+assert_not_contains "$out" "supervised, watchdog armed" "and does not print the old success line"
+if [[ -n "$first_pid" ]] && kill -0 "$first_pid" 2>/dev/null; then
+    ok "the healthy ss-redir is STILL ALIVE after the redundant start"
+else
+    bad "the redundant start KILLED the healthy ss-redir (pid ${first_pid})"
+fi
+assert_eq "$second_pid" "$first_pid" "no replacement process: the same pid is still serving"
+assert_eq "$(cat "${SANDBOX_DIR}/xdg/vpn-proxy/ss-redir.pid" 2>/dev/null || true)" \
+    "$first_pid" "the supervised pidfile still names the original process"
+assert_eq "$(count_calls '^ss-redir ')" "1" "still exactly one ss-redir spawn in total"
+assert_file_absent "$REQUEST" "the redundant start writes no start-request"
+teardown_sandbox
+echo
+
+# --------------------------------------------------------------------------
 echo "[3] a delegated start really runs the unit, and the unit does not recurse"
 prepare loaded setsid
 out="$(VP_SYSTEMCTL_EXEC=1 run_proxy yes -- start)"
@@ -469,6 +546,31 @@ prepare loaded setsid
 printf 'ts=%s\nmode=full\nexcludes=\n' "$(( $(date +%s) - 400 ))" > "$REQUEST"
 out="$(run_in_unit start)"
 assert_not_contains "$out" "mode=all TCP" "a 400s-old request does not override the default"
+teardown_sandbox
+echo
+
+# --------------------------------------------------------------------------
+echo "[10b] a non-numeric ts degrades to the config mode, it does not abort start"
+# `ts` is read from a FILE. With `ts=abc`, `$(( now - ts ))` raised an
+# unbound-variable error under `set -u`, which killed the whole in-unit
+# ExecStart instead of degrading to "no request, use config.sh's mode".
+prepare loaded setsid
+printf 'ts=abc\nmode=full\nexcludes=\n' > "$REQUEST"
+out="$(run_in_unit start)"
+assert_not_contains "$out" "unbound variable" "a non-numeric ts raises no bash arithmetic error"
+assert_contains "$out" "[OK] Transparent proxy active" "the in-unit start still completes"
+assert_not_contains "$out" "mode=all TCP" "the malformed request does not apply mode=full"
+assert_file_absent "$REQUEST" "the malformed request is consumed, not left in /run"
+teardown_sandbox
+echo
+
+# --------------------------------------------------------------------------
+echo "[10c] a zero-byte request file is consumed, not left in /run"
+prepare loaded setsid
+: > "$REQUEST"
+out="$(run_in_unit start)"
+assert_file_absent "$REQUEST" "the empty request file is removed, not stranded"
+assert_contains "$out" "[OK] Transparent proxy active" "and the in-unit start still completes"
 teardown_sandbox
 echo
 

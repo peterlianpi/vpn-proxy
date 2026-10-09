@@ -255,7 +255,12 @@ write_start_request() {
 # Consumes the file (single-use). Never trips `set -e` on a short or empty
 # file — a truncated request must degrade to "no request", not abort start.
 read_start_request() {
-    [[ -s "$REQUEST_FILE" ]] || return 1
+    # A zero-byte request is still CONSUMED. Returning here used to leave a
+    # stray /run/vpn-proxy/start-request behind for the next start to pick up.
+    if [[ ! -s "$REQUEST_FILE" ]]; then
+        rm -f "$REQUEST_FILE"
+        return 1
+    fi
 
     local ts mode excludes line key value
     ts="" mode="" excludes=""
@@ -270,6 +275,15 @@ read_start_request() {
     done < "$REQUEST_FILE"
 
     if [[ -z "$ts" || -z "$mode" ]]; then
+        rm -f "$REQUEST_FILE"
+        return 1
+    fi
+    # `ts` comes from a FILE, not from code we control, so it can be junk.
+    # Validate it as a number before it ever reaches `$(( ))`: bash raises an
+    # unbound-variable error on a non-numeric operand under `set -u`, and
+    # that kills the WHOLE in-unit ExecStart instead of degrading to "no
+    # request, use config.sh's mode".
+    if [[ ! "$ts" =~ ^[0-9]+$ ]]; then
         rm -f "$REQUEST_FILE"
         return 1
     fi
@@ -730,11 +744,37 @@ cmd_start() {
     # the path that makes `sudo vpn-proxy start` durable: the unit's
     # ExecStart re-enters this same script, now inside the unit's cgroup.
     # Placed before every spawn/write so this run creates nothing itself.
-    if ! in_systemd_unit && unit_available && unit_runs_this_script; then
+    #
+    # (2a) Idempotence, checked FIRST. `systemctl start` on an ALREADY-ACTIVE
+    # Type=oneshot + RemainAfterExit=yes unit is a NO-OP: systemd does NOT
+    # re-run ExecStart (verified against real systemd). So the `stop_ss_redir`
+    # in (2b) would kill the healthy supervised ss-redir and NOTHING would put
+    # a listener back — while the command still printed "[OK] … started" and
+    # exited 0. `cmd_stop` (:801) and `cmd_reload` (:943) already gate on
+    # `unit_is_active`; start is now the same shape. Nothing is killed, no
+    # `systemctl start` is issued, and the request file is never written.
+    if ! in_systemd_unit && unit_available && unit_runs_this_script \
+       && unit_is_active; then
+        echo "[OK] $VP_UNIT already active — nothing to do"
+        echo ""
+        if [[ "$PROXY_MODE_FROM_CLI" -eq 1 ]]; then
+            echo "    mode '$PROXY_MODE' was requested, but the unit is already running."
+            echo "    Apply it with a restart: sudo $0 restart $PROXY_MODE"
+        else
+            echo "    To restart it (picks up config changes): sudo $0 restart"
+        fi
+        return 0
+    fi
+
+    # (2b) Genuinely (re)starting an INACTIVE unit. Only here is it safe to
+    # drop leftover ss-redir processes.
+    if ! in_systemd_unit && unit_available && unit_runs_this_script \
+       && ! unit_is_active; then
         write_start_request
         # Drop any leftover ss-redir from an earlier unsupervised direct
         # start: it would keep :$SS_REDIR_PORT bound and make the unit's own
-        # ss-redir fail to bind.
+        # ss-redir fail to bind. Safe ONLY because the unit is not active,
+        # i.e. there is no supervised listener here to lose.
         stop_ss_redir
         if systemctl start "$VP_UNIT"; then
             echo "[OK] $VP_UNIT started, supervised, watchdog armed"

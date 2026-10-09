@@ -134,11 +134,20 @@ Set the persisted default in `config.sh`: `PROXY_MODE="selective"` (shipped),
 
 #### How `start` works
 
-`sudo vpn-proxy start` **does not start ss-redir itself.** It writes the
-requested mode to a short-lived request file and runs `systemctl start
-vpn-proxy`. The unit's `ExecStart` then runs `vpn-proxy start` again — this
-time inside the unit — and *that* run starts ss-redir, so the listener ends
-up in `/system.slice/vpn-proxy.service`, watched by the watchdog timer.
+`sudo vpn-proxy start` **does not start ss-redir itself.** If the unit is not
+already active, it writes the requested mode to a short-lived request file
+and runs `systemctl start vpn-proxy`. The unit's `ExecStart` then runs
+`vpn-proxy start` again — this time inside the unit — and *that* run starts
+ss-redir, so the listener ends up in `/system.slice/vpn-proxy.service`,
+watched by the watchdog timer.
+
+If the unit **is** already active, `start` is idempotent: it prints
+`[OK] vpn-proxy.service already active — nothing to do`, kills nothing, and
+issues no `systemctl start`. That guard is not cosmetic. `systemctl start`
+on an active `Type=oneshot` + `RemainAfterExit=yes` unit is a **no-op** —
+ExecStart is *not* re-run — so cleaning up leftover ss-redir processes
+first would take the healthy listener down with nothing to replace it, while
+still printing `[OK] … started`. Use `vpn-proxy restart` to change the mode.
 
 Why this matters: the old implementation ran `nohup ss-redir … &` from your
 terminal. That child inherits your **session** cgroup, so closing the
@@ -461,7 +470,13 @@ asserts that:
    the real `ss-redir` PID**, not `setsid`'s short-lived parent;
 6. `stop` with an active unit only calls `systemctl stop`, so the watchdog
    cannot resurrect the proxy;
-7. a failing `systemctl start` is loud and never falls back silently.
+7. a failing `systemctl start` is loud and never falls back silently;
+8. a **second** `start` while the unit is already active leaves the healthy
+   `ss-redir` **alive and unreplaced** — same PID, same pidfile, no second
+   spawn — and never issues `systemctl start`;
+9. a malformed (`ts=abc`) or zero-byte request file degrades to the config
+   mode instead of aborting the in-unit start, and is consumed rather than
+   left behind in `/run`.
 
 Both harnesses run the real `proxy.sh` as your own user against a private
 copy with a placeholder key and a unique `SS_REDIR_PORT`, so a production
