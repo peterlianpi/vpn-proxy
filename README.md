@@ -1,7 +1,8 @@
 # Outline VPN Proxy
 
 Transparent TCP proxy using Outline/Shadowsocks. By default only the domains
-listed in `domains.txt` (the GitHub REST API and the Facebook family) are routed
+listed in `domains.txt` (the GitHub REST API, the Facebook family, and the AI
+coding tool Cursor `cursor.com`) are routed
 through an external server; everything else — package registries, `github.com`,
 Google, CDNs — stays direct at full speed. A `vpn-proxy-watchdog.timer` keeps the
 proxy alive: if `ss-redir`, the iptables jump or the ipset dies, the unit is
@@ -72,9 +73,10 @@ while unblocking the sites that actually need the VPN.
 Precedence: **CLI flag > `PROXY_MODE` in `config.sh` > built-in `selective`.**
 
 The shipped `domains.txt` covers what needs the tunnel on most networks:
-the GitHub REST API (`api.github.com`) and the Facebook family
+the GitHub REST API (`api.github.com`), the Facebook family
 (`facebook.com`, `www.facebook.com`, `graph.facebook.com`,
-`upload.facebook.com`, `developers.facebook.com`, `fbcdn.net`, `fb.com`).
+`upload.facebook.com`, `developers.facebook.com`, `fbcdn.net`, `fb.com`),
+and the AI coding tool Cursor (`cursor.com`).
 
 > **The domain list is literal FQDNs only.** It is resolved with `dig +short A <name>`,
 > so an apex name does **not** cover its subdomains — `facebook.com` will not

@@ -73,7 +73,7 @@ domain list:
 
 ```bash
 sudo apt install ipset
-cat domains.txt                    # shipped list: GitHub API + Facebook family
+cat domains.txt                    # shipped list: GitHub API + Facebook family + cursor.com
 sudo ./proxy.sh start              # selective, because PROXY_MODE defaults to it
 ```
 
@@ -129,12 +129,13 @@ domains.txt  →  dig/resolve  →  ipset (vpn_proxy_domains)  →  iptables  �
 
 The shipped `domains.txt.example` contains only what is **blocked or
 geo-restricted** on the network it was built for. On the network this project
-was tuned against, that is:
+was tuned against, that is three active groups:
 
 | Group | Entries | Why |
 |-------|---------|-----|
 | GitHub REST API | `api.github.com` | The API is TCP-blocked, but git clone, raw content and release downloads over `github.com` work fine direct and stay fast |
 | Facebook family | `facebook.com`, `www.facebook.com`, `graph.facebook.com`, `upload.facebook.com`, `developers.facebook.com`, `fbcdn.net`, `fb.com` | The whole family is TCP-blocked direct |
+| Cursor (AI dev tool) | `cursor.com` | Added to the active list for this operator's network |
 
 Google / googleapis / gstatic / googleusercontent / aistudio.google.com are
 **not** in the active list. They were verified to reach the internet fine

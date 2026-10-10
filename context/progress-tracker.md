@@ -321,6 +321,50 @@ still never printed for merely unverifiable rules.
 (still exactly 8 active entries). Mode precedence is CLI > `config.sh` >
 built-in `selective`, with the request file inserted strictly below CLI.
 
+## Phase 4 — cursor.com in the selective list (2026-10-10)
+
+Added `cursor.com` as an active entry in a new third group and renumbered the
+commented OPTIONAL block, so the shipped list now enumerates three active
+groups.
+
+### Active list change
+
+- New **Group 3: AI / dev tools (geo-restricted)** in `domains.txt.example`
+  holds the single literal FQDN `cursor.com` with a short, neutral rationale.
+  Subdomains are still added on their own line per the literal-FQDN rule.
+- The former **Group 3: OPTIONAL / geo-restricted** block is renumbered
+  **Group 4**; its commented Google / AI Studio entries are otherwise
+  untouched.
+- `domains.txt` was updated in place with the exact same insertion + renumber,
+  so the two files stay in line-parity. It remains **gitignored and is not part
+  of this commit**.
+
+### Docs synced
+
+- `README.md` — the top parenthetical and the shipped-list paragraph now read
+  GitHub REST API + Facebook family + the AI coding tool Cursor (`cursor.com`).
+- `docs/domain-routing.md` — the `cat domains.txt` command comment, the
+  example-list intro ("three active groups"), and a new Cursor row after the
+  Facebook row in the group table. The Google OPTIONAL prose is left intact.
+
+### Changed files
+
+- `domains.txt.example`
+- `README.md`
+- `docs/domain-routing.md`
+- `context/progress-tracker.md`
+
+### Not changed (deliberately)
+
+`domains.txt` is updated on disk but never staged. No other domain was added;
+`domains-myanmar.txt.example`, `proxy.sh`, `install.sh`, the systemd units and
+the sandbox tests are untouched.
+
+The Phase 2 / Phase 3 "Not changed (deliberately)" notes still record "exactly
+8 active entries" — that was accurate for those phases and is kept as the
+historical record. This Phase 4 entry supersedes them: the list now has
+9 active entries across 3 groups.
+
 ## System Design Checklist
 
 Refer to `architecture.md` > System Design & Infrastructure

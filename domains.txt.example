@@ -39,7 +39,13 @@ developers.facebook.com
 fbcdn.net
 fb.com
 
-# --- Group 3: OPTIONAL / geo-restricted ----------------------------------
+# --- Group 3: AI / dev tools (geo-restricted) ---------------------------
+# Why: cursor.com is added to the active list for this operator's network.
+# Literal FQDN only per the rule above — add any subdomain you actually
+# hit on its own line.
+cursor.com
+
+# --- Group 4: OPTIONAL / geo-restricted ---------------------------------
 # These resolve and connect fine DIRECT from this host, so they are
 # parked here to keep the default list minimal (smaller ipset, fewer
 # surprises). Uncomment the ones you actually need if you move to a
